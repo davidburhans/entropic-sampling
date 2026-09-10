@@ -13,6 +13,7 @@ from sampler import (
     future_entropy_sampler_llama,
     future_entropy_sampler,
     list_local_models,
+    load_llama_model,
 )
 
 
@@ -424,15 +425,11 @@ def main():
     print("Beginning comparative sampling runs...\n")
 
     if os.path.isfile(model_path) and model_path.endswith(".gguf"):
-        from llama_cpp import Llama
-
-        llm = Llama(
+        llm = load_llama_model(
             model_path=model_path,
             n_ctx=2048,
             n_gpu_layers=args.n_gpu_layers,
             seed=args.seed,
-            logits_all=True,
-            verbose=False,
         )
 
         results = run_comparison_llama(

@@ -298,12 +298,126 @@ def future_entropy_sampler_llama(
         return prompt + output_text
 
 
+def get_model_size_bytes(model_path):
+    """
+    Returns total size in bytes of the model, summing parts if multi-part GGUF.
+    """
+    if os.path.isdir(model_path):
+        total = 0
+        for root, _, files in os.walk(model_path):
+            for f in files:
+                total += os.path.getsize(os.path.join(root, f))
+        return total
+    elif os.path.isfile(model_path):
+        import re
+        match = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", model_path)
+        if match:
+            prefix = model_path[: match.start()]
+            dirname = os.path.dirname(model_path)
+            total = 0
+            if os.path.exists(dirname):
+                for f in os.listdir(dirname):
+                    full = os.path.join(dirname, f)
+                    if full.startswith(prefix) and full.endswith(".gguf") and os.path.isfile(full):
+                        total += os.path.getsize(full)
+            return total if total > 0 else os.path.getsize(model_path)
+        return os.path.getsize(model_path)
+    return 0
+
+
+def format_size(num_bytes):
+    if num_bytes >= 1024 ** 3:
+        return f"{num_bytes / (1024 ** 3):.1f} GB"
+    elif num_bytes >= 1024 ** 2:
+        return f"{num_bytes / (1024 ** 2):.1f} MB"
+    return f"{num_bytes} B"
+
+
+def calculate_auto_gpu_layers(model_path, requested_layers=-1, n_ctx=2048):
+    """
+    If requested_layers is -1, inspects model size against available GPU VRAM.
+    If the model exceeds VRAM, calculates the maximum safe number of layers to offload.
+    """
+    if requested_layers != -1:
+        return requested_layers
+
+    if not torch.cuda.is_available():
+        return 0
+
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        free_gb = free_bytes / (1024 ** 3)
+    except Exception:
+        return -1
+
+    model_bytes = get_model_size_bytes(model_path)
+    model_gb = model_bytes / (1024 ** 3)
+
+    # Reserve 3.5 GB for context / KV cache / compute buffers
+    usable_vram_gb = max(0.0, free_gb - 3.5)
+
+    if model_gb <= usable_vram_gb:
+        return -1  # Fits completely in GPU VRAM
+
+    # Model exceeds free VRAM. Inspect block_count from GGUF metadata
+    block_count = 32  # standard default fallback
+    try:
+        from gguf import GGUFReader
+        reader = GGUFReader(model_path)
+        arch = None
+        for f in reader.fields.values():
+            if f.name == "general.architecture":
+                arch = bytes(f.parts[-1]).decode("utf-8")
+                break
+        if arch and f"{arch}.block_count" in reader.fields:
+            block_count = reader.fields[f"{arch}.block_count"].parts[-1].tolist()[0]
+    except Exception:
+        pass
+
+    ratio = max(0.0, usable_vram_gb / max(1.0, model_gb))
+    safe_layers = max(1, int(block_count * ratio))
+    print(f"\n[VRAM Guard] Model ({model_gb:.1f} GB) exceeds free VRAM ({free_gb:.1f} GB).")
+    print(f"[VRAM Guard] Auto-tuning offload to {safe_layers}/{block_count} layers (hybrid GPU/CPU execution).\n")
+    return safe_layers
+
+
+def load_llama_model(model_path, n_ctx=2048, n_gpu_layers=-1, seed=None):
+    """
+    Loads a GGUF model with llama.cpp, applying automatic safe layer offloading
+    if the model exceeds physical GPU memory.
+    """
+    from llama_cpp import Llama
+    layers = calculate_auto_gpu_layers(model_path, requested_layers=n_gpu_layers, n_ctx=n_ctx)
+    try:
+        return Llama(
+            model_path=model_path,
+            n_ctx=n_ctx,
+            n_gpu_layers=layers,
+            seed=seed if seed is not None else 42,
+            logits_all=True,
+            verbose=False,
+        )
+    except ValueError as e:
+        if layers > 0:
+            print(f"[VRAM Guard] Offload with {layers} layers failed; falling back to CPU (n_gpu_layers=0)...")
+            return Llama(
+                model_path=model_path,
+                n_ctx=n_ctx,
+                n_gpu_layers=0,
+                seed=seed if seed is not None else 42,
+                logits_all=True,
+                verbose=False,
+            )
+        raise e
+
+
 def list_local_models():
     """
     Scans standard local caches across platforms (Linux, macOS, Windows)
     and optional user directories (MODELS_DIR) for usable GGUF or Transformers models,
-    excluding multimodal projectors (mmproj).
+    excluding multimodal projectors (mmproj) and non-primary split GGUF shards.
     """
+    import re
     models = []
     seen_paths = set()
 
@@ -312,6 +426,24 @@ def list_local_models():
         if real not in seen_paths and os.path.exists(path):
             seen_paths.add(real)
             models.append({"name": name, "path": path, "type": mtype})
+
+    def process_gguf_file(f, full_path, display_prefix):
+        # Skip multimodal projectors
+        if f.startswith("mmproj") or "mmproj" in f:
+            return
+        # If multi-part split GGUF (e.g. -00002-of-00005.gguf), only keep the first shard (-00001-of-)
+        match = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", f)
+        if match:
+            part_num = int(match.group(1))
+            total_parts = int(match.group(2))
+            if part_num != 1:
+                return  # Skip secondary shards
+            total_size = get_model_size_bytes(full_path)
+            clean_name = f[: match.start()]
+            add_model(f"{display_prefix} ({clean_name}, {total_parts} parts, {format_size(total_size)})", full_path, "gguf")
+        else:
+            size_str = format_size(os.path.getsize(full_path))
+            add_model(f"{display_prefix} ({size_str})", full_path, "gguf")
 
     # 1. Custom / local directories via environment variable or current ./models dir
     custom_dirs = []
@@ -327,12 +459,13 @@ def list_local_models():
         if os.path.isdir(cdir):
             for root, _, files in os.walk(cdir):
                 for f in files:
-                    if f.endswith('.gguf') and not f.startswith('mmproj') and 'mmproj' not in f:
+                    if f.endswith(".gguf"):
                         rel = os.path.relpath(os.path.join(root, f), cdir)
-                        add_model(f"[Local Dir] {rel}", os.path.join(root, f), "gguf")
+                        process_gguf_file(f, os.path.join(root, f), f"[Local Dir] {rel}")
                 if os.path.exists(os.path.join(root, "config.json")):
                     rel = os.path.relpath(root, cdir)
-                    add_model(f"[Local Transformers] {rel}", root, "transformers")
+                    dir_size = get_model_size_bytes(root)
+                    add_model(f"[Local Transformers] {rel} ({format_size(dir_size)})", root, "transformers")
 
     # 2. HuggingFace Cache (respects HF_HOME if set)
     hf_home = os.environ.get("HF_HOME")
@@ -352,12 +485,13 @@ def list_local_models():
                         found_gguf = False
                         for root, _, files in os.walk(snap_path):
                             for f in files:
-                                if f.endswith('.gguf') and not f.startswith('mmproj') and 'mmproj' not in f:
+                                if f.endswith(".gguf"):
                                     rel = os.path.relpath(os.path.join(root, f), snap_path)
-                                    add_model(f"[HF GGUF] {model_name} ({rel})", os.path.join(root, f), "gguf")
+                                    process_gguf_file(f, os.path.join(root, f), f"[HF GGUF] {model_name} ({rel})")
                                     found_gguf = True
                         if not found_gguf and os.path.exists(os.path.join(snap_path, "config.json")):
-                            add_model(f"[HF Transformers] {model_name}", snap_path, "transformers")
+                            dir_size = get_model_size_bytes(snap_path)
+                            add_model(f"[HF Transformers] {model_name} ({format_size(dir_size)})", snap_path, "transformers")
 
     # 3. LM Studio Caches (Linux, macOS, Windows)
     lm_candidates = [
@@ -373,9 +507,9 @@ def list_local_models():
         if os.path.exists(lm_studio_dir):
             for root, _, files in os.walk(lm_studio_dir):
                 for file in files:
-                    if file.endswith(".gguf") and not file.startswith('mmproj') and 'mmproj' not in file:
-                        rel_path = os.path.relpath(root, lm_studio_dir)
-                        add_model(f"[LM Studio] {rel_path}/{file}", os.path.join(root, file), "gguf")
+                    if file.endswith(".gguf"):
+                        rel_path = os.path.relpath(os.path.join(root, file), lm_studio_dir)
+                        process_gguf_file(file, os.path.join(root, file), f"[LM Studio] {rel_path}")
 
     # 4. GPT4All Caches (Linux, macOS, Windows)
     gpt4all_candidates = [
@@ -389,17 +523,17 @@ def list_local_models():
     for gpt4all_dir in gpt4all_candidates:
         if os.path.exists(gpt4all_dir):
             for file in os.listdir(gpt4all_dir):
-                if file.endswith(".gguf") and not file.startswith('mmproj') and 'mmproj' not in file:
-                    add_model(f"[GPT4All] {file}", os.path.join(gpt4all_dir, file), "gguf")
+                if file.endswith(".gguf"):
+                    process_gguf_file(file, os.path.join(gpt4all_dir, file), f"[GPT4All] {file}")
 
     # 5. Ollama models directory (OLLAMA_MODELS or default)
     ollama_dir = os.environ.get("OLLAMA_MODELS", os.path.expanduser("~/.ollama/models"))
     if os.path.exists(ollama_dir):
         for root, _, files in os.walk(ollama_dir):
             for file in files:
-                if file.endswith(".gguf") and not file.startswith('mmproj') and 'mmproj' not in file:
+                if file.endswith(".gguf"):
                     rel_path = os.path.relpath(os.path.join(root, file), ollama_dir)
-                    add_model(f"[Ollama] {rel_path}", os.path.join(root, file), "gguf")
+                    process_gguf_file(file, os.path.join(root, file), f"[Ollama] {rel_path}")
 
     return sorted(models, key=lambda x: x["name"])
 
@@ -475,13 +609,11 @@ def main():
             print("Please install llama-cpp-python to run GGUF files.")
             exit(1)
             
-        print(f"Loading GGUF model into llama.cpp with n_gpu_layers={args.n_gpu_layers}...")
-        llm = Llama(
+        print(f"Loading GGUF model into llama.cpp (requested n_gpu_layers={args.n_gpu_layers})...")
+        llm = load_llama_model(
             model_path=model_path, 
             n_ctx=2048, 
             n_gpu_layers=args.n_gpu_layers, 
-            logits_all=True, 
-            verbose=False
         )
         print("Generating text with future-entropy sampler...")
         result = future_entropy_sampler_llama(
