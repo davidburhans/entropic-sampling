@@ -1,0 +1,483 @@
+import os
+import math
+import argparse
+import torch
+import jinja2
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+def compute_normalized_entropy(probs, top_n):
+    """
+    Computes Shannon entropy over the top-n tokens, normalized to [0, 1] by log(n).
+    T_n(w) = top-n(q_w)
+    q_tilde(v) = q_w(v) / sum(q_w(u))
+    H_hat(w) = -sum(q_tilde(v) * log(q_tilde(v))) / log(top_n)
+    """
+    k = min(top_n, probs.shape[-1])
+    top_n_probs, _ = torch.topk(probs, k, dim=-1)
+    top_n_probs_renorm = top_n_probs / (top_n_probs.sum(dim=-1, keepdim=True) + 1e-12)
+    entropy = -torch.sum(top_n_probs_renorm * torch.log(top_n_probs_renorm + 1e-12), dim=-1)
+    norm_entropy = entropy / math.log(k if k > 1 else 2)
+    return norm_entropy
+
+
+def compute_alpha_weights(alpha):
+    """
+    Crossfader exponents from Count Bayesie:
+    a = 1 - max(0, alpha)
+    b = 1 - max(0, -alpha)
+    where alpha in [-1, 1]:
+      alpha = -1.0 -> a=1, b=0 (pure probability / greedy)
+      alpha =  0.0 -> a=1, b=1 (balanced future-entropy: p(w|c) * H_hat(w))
+      alpha = +1.0 -> a=0, b=1 (pure future-entropy: H_hat(w))
+    """
+    alpha = max(-1.0, min(1.0, alpha))
+    a = 1.0 - max(0.0, alpha)
+    b = 1.0 - max(0.0, -alpha)
+    return a, b
+
+
+def format_instruct_prompt(llm, user_prompt, skip_thought=True):
+    """
+    Formats an instruction prompt using the model's chat template from GGUF metadata.
+    For reasoning models (like Gemma 4), optionally closes the thought channel so the
+    model proceeds straight to generating the creative story.
+    """
+    tmpl = llm.metadata.get('tokenizer.chat_template')
+    if tmpl:
+        try:
+            t = jinja2.Template(tmpl)
+            formatted = t.render(
+                messages=[{'role': 'user', 'content': user_prompt}],
+                add_generation_prompt=True,
+                bos_token='',
+                eos_token=''
+            )
+            if skip_thought:
+                if formatted.endswith('<|turn>model\n'):
+                    formatted += '<|channel>thought\n<channel|>'
+                elif formatted.endswith('<think>\n'):
+                    formatted += '</think>\n'
+            return formatted
+        except Exception:
+            pass
+
+    # Generic ChatML fallback if instruct requested but template missing
+    return f"<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
+
+
+def future_entropy_sampler(
+    model, 
+    tokenizer, 
+    prompt, 
+    max_new_tokens=80, 
+    cand_k=8, 
+    top_n_future=10, 
+    wavelength=12.0,
+    amp=0.65,
+    min_p=0.01,
+    alpha_constant=None,
+    sample=False,
+    verbose_steps=False
+):
+    """
+    Generates text using the future-entropy sampler with alpha-wave rhythmic decoding
+    using PyTorch / HuggingFace Transformers.
+    """
+    device = model.device
+    input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+    prompt_len = input_ids.shape[1]
+    
+    for step in range(max_new_tokens):
+        with torch.no_grad():
+            outputs = model(input_ids)
+            next_token_logits = outputs.logits[0, -1, :]
+            w_probs = torch.softmax(next_token_logits, dim=-1)
+            
+            # 1. Top cand_k candidates for w with min_p filtering
+            k = min(cand_k, w_probs.shape[-1])
+            top_k_w_probs, top_k_w_indices = torch.topk(w_probs, k)
+            
+            mask = top_k_w_probs >= min_p
+            if not mask.any():
+                chosen_w = top_k_w_indices[0]
+                input_ids = torch.cat([input_ids, chosen_w.unsqueeze(0).unsqueeze(0)], dim=1)
+                if chosen_w.item() == tokenizer.eos_token_id:
+                    break
+                continue
+                
+            top_k_w_probs = top_k_w_probs[mask]
+            top_k_w_indices = top_k_w_indices[mask]
+            
+            # 2. Batch forward pass to look ahead into the future q_w
+            batched_input_ids = []
+            for w in top_k_w_indices:
+                batched_input_ids.append(torch.cat([input_ids, w.unsqueeze(0).unsqueeze(0)], dim=1))
+            batched_input_ids = torch.cat(batched_input_ids, dim=0)
+            
+            future_outputs = model(batched_input_ids)
+            future_logits = future_outputs.logits[:, -1, :]
+            future_probs = torch.softmax(future_logits, dim=-1)
+            
+            # 3. Compute normalized entropy H_hat(w)
+            normalized_entropies = compute_normalized_entropy(future_probs, top_n_future)
+            
+            # 4. Calculate alpha for this step
+            if alpha_constant is not None:
+                alpha = float(alpha_constant)
+            else:
+                alpha = amp * math.sin(2.0 * math.pi * step / wavelength)
+            alpha = max(-1.0, min(1.0, alpha))
+            a, b = compute_alpha_weights(alpha)
+            
+            # 5. Score candidates: s(w) = p(w|c)^a * H_hat(w)^b
+            scores = (top_k_w_probs ** a) * (normalized_entropies ** b)
+            
+            # 6. Candidate selection: argmax (default) or multinomial
+            if sample:
+                scores_sum = scores.sum()
+                probs = scores / scores_sum if scores_sum > 0 else torch.ones_like(scores) / len(scores)
+                chosen_idx = torch.multinomial(probs, 1).item()
+            else:
+                chosen_idx = torch.argmax(scores).item()
+                
+            chosen_w = top_k_w_indices[chosen_idx]
+            
+            if verbose_steps:
+                tok_str = tokenizer.decode([chosen_w.item()])
+                print(f"[Step {step:02d}] alpha={alpha:+.2f} (a={a:.2f}, b={b:.2f}) -> chosen={repr(tok_str)}")
+                
+            input_ids = torch.cat([input_ids, chosen_w.unsqueeze(0).unsqueeze(0)], dim=1)
+            
+            if chosen_w.item() == tokenizer.eos_token_id:
+                break
+                
+    return tokenizer.decode(input_ids[0], skip_special_tokens=True)
+
+
+def future_entropy_sampler_llama(
+    llm, 
+    prompt, 
+    max_new_tokens=80, 
+    cand_k=8, 
+    top_n_future=10, 
+    wavelength=12.0,
+    amp=0.65,
+    min_p=0.01,
+    alpha_constant=None,
+    sample=False,
+    instruct=False,
+    skip_thought=True,
+    verbose_steps=False
+):
+    """
+    Generates text using the future-entropy sampler with alpha-wave rhythmic decoding
+    using llama-cpp-python.
+    """
+    if instruct:
+        formatted_prompt = format_instruct_prompt(llm, prompt, skip_thought=skip_thought)
+    else:
+        formatted_prompt = prompt
+
+    # MUST pass special=True so special/chat tokens are correctly tokenized
+    input_ids = llm.tokenize(formatted_prompt.encode('utf-8'), special=True)
+    llm.reset()
+    llm.eval(input_ids)
+    
+    # Probe whether model supports fast in-VRAM KV cache rollback (e.g. RoPE vs M-RoPE)
+    use_vram_rollback = True
+    saved_n = llm.n_tokens
+    try:
+        dummy_tok = input_ids[-1] if len(input_ids) > 0 else 1
+        llm.eval([dummy_tok])
+        llm.n_tokens = saved_n
+        llm.eval([dummy_tok])
+        llm.n_tokens = saved_n
+    except Exception:
+        use_vram_rollback = False
+        llm.reset()
+        llm.eval(input_ids)
+
+    # Collect stop tokens
+    stop_tokens = {llm.token_eos()}
+    for s in ['<turn|>', '<|im_end|>', '<|eot_id|>', '<end_of_turn>', '</s>', '<eos>']:
+        try:
+            toks = llm.tokenize(s.encode('utf-8'), special=True, add_bos=False)
+            if len(toks) == 1:
+                stop_tokens.add(toks[0])
+        except Exception:
+            pass
+
+    generated_tokens = []
+    
+    for step in range(max_new_tokens):
+        logits = torch.tensor(llm._scores[-1, :])
+        w_probs = torch.softmax(logits, dim=-1)
+        
+        # Candidate selection: top cand_k candidates with min_p filtering
+        k = min(cand_k, len(w_probs))
+        topk = torch.topk(w_probs, k)
+        mask = topk.values >= min_p
+        if not mask.any():
+            chosen_w = topk.indices[0].item()
+            generated_tokens.append(chosen_w)
+            llm.eval([chosen_w])
+            if chosen_w in stop_tokens:
+                break
+            continue
+
+        top_k_w_probs = topk.values[mask]
+        top_k_w_indices = topk.indices[mask]
+        
+        # Speculative lookahead: in-VRAM rollback if supported, else save_state/load_state
+        normalized_entropies = []
+        if use_vram_rollback:
+            saved_n_tokens = llm.n_tokens
+            for w in top_k_w_indices:
+                w_idx = w.item()
+                llm.eval([w_idx])
+                future_logits = torch.tensor(llm._scores[-1, :])
+                future_probs = torch.softmax(future_logits, dim=-1)
+                norm_entropy = compute_normalized_entropy(future_probs, top_n_future)
+                normalized_entropies.append(norm_entropy)
+                llm.n_tokens = saved_n_tokens
+        else:
+            state = llm.save_state()
+            for w in top_k_w_indices:
+                w_idx = w.item()
+                llm.eval([w_idx])
+                future_logits = torch.tensor(llm._scores[-1, :])
+                future_probs = torch.softmax(future_logits, dim=-1)
+                norm_entropy = compute_normalized_entropy(future_probs, top_n_future)
+                normalized_entropies.append(norm_entropy)
+                llm.load_state(state)
+            
+        normalized_entropies = torch.stack(normalized_entropies)
+        
+        # Calculate alpha for this step
+        if alpha_constant is not None:
+            alpha = float(alpha_constant)
+        else:
+            alpha = amp * math.sin(2.0 * math.pi * step / wavelength)
+        alpha = max(-1.0, min(1.0, alpha))
+        a, b = compute_alpha_weights(alpha)
+        
+        # Score candidates: s(w) = p(w|c)^a * H_hat(w)^b
+        scores = (top_k_w_probs ** a) * (normalized_entropies ** b)
+        
+        # Candidate selection: argmax (default) or multinomial
+        if sample:
+            scores_sum = scores.sum()
+            probs = scores / scores_sum if scores_sum > 0 else torch.ones_like(scores) / len(scores)
+            chosen_idx = torch.multinomial(probs, 1).item()
+        else:
+            chosen_idx = torch.argmax(scores).item()
+            
+        chosen_w = top_k_w_indices[chosen_idx].item()
+        
+        if verbose_steps:
+            tok_str = llm.detokenize([chosen_w]).decode('utf-8', errors='ignore')
+            print(f"[Step {step:02d}] alpha={alpha:+.2f} (a={a:.2f}, b={b:.2f}) -> chosen={repr(tok_str)}")
+            
+        generated_tokens.append(chosen_w)
+        llm.eval([chosen_w])
+        
+        if chosen_w in stop_tokens:
+            break
+            
+    output_text = llm.detokenize(generated_tokens).decode('utf-8', errors='ignore')
+    
+    # Strip any trailing stop marker
+    for s in ['<turn|>', '<|im_end|>', '<|eot_id|>', '<end_of_turn>', '</s>', '<eos>']:
+        if output_text.endswith(s):
+            output_text = output_text[:-len(s)]
+            
+    if instruct:
+        return output_text.strip()
+    else:
+        return prompt + output_text
+
+
+def list_local_models():
+    """
+    Scans HuggingFace, LM Studio, and GPT4All caches for usable models,
+    excluding multimodal projectors (mmproj).
+    """
+    models = []
+    
+    # 1. HuggingFace Cache
+    hf_cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+    if os.path.exists(hf_cache_dir):
+        for item in os.listdir(hf_cache_dir):
+            if item.startswith("models--"):
+                model_name = item.replace("models--", "").replace("--", "/")
+                snapshots_dir = os.path.join(hf_cache_dir, item, "snapshots")
+                if os.path.exists(snapshots_dir):
+                    for commit_hash in os.listdir(snapshots_dir):
+                        snap_path = os.path.join(snapshots_dir, commit_hash)
+                        found_gguf = False
+                        for root, _, files in os.walk(snap_path):
+                            for f in files:
+                                if f.endswith('.gguf') and not f.startswith('mmproj') and 'mmproj' not in f:
+                                    rel = os.path.relpath(os.path.join(root, f), snap_path)
+                                    models.append({
+                                        "name": f"[HF GGUF] {model_name} ({rel})",
+                                        "path": os.path.join(root, f),
+                                        "type": "gguf"
+                                    })
+                                    found_gguf = True
+                        if not found_gguf and os.path.exists(os.path.join(snap_path, "config.json")):
+                            models.append({
+                                "name": f"[HF Transformers] {model_name}",
+                                "path": snap_path,
+                                "type": "transformers"
+                            })
+
+    # 2. LM Studio Cache
+    lm_studio_dir = os.path.expanduser("~/.cache/lm-studio/models")
+    if os.path.exists(lm_studio_dir):
+        for root, _, files in os.walk(lm_studio_dir):
+            for file in files:
+                if file.endswith(".gguf") and not file.startswith('mmproj') and 'mmproj' not in file:
+                    rel_path = os.path.relpath(root, lm_studio_dir)
+                    models.append({
+                        "name": f"[LM Studio] {rel_path}/{file}",
+                        "path": os.path.join(root, file),
+                        "type": "gguf"
+                    })
+
+    # 3. GPT4All Cache
+    gpt4all_dir = os.path.expanduser("~/.local/share/nomic.ai/GPT4All/")
+    if os.path.exists(gpt4all_dir):
+        for file in os.listdir(gpt4all_dir):
+            if file.endswith(".gguf") and not file.startswith('mmproj') and 'mmproj' not in file:
+                models.append({
+                    "name": f"[GPT4All] {file}",
+                    "path": os.path.join(gpt4all_dir, file),
+                    "type": "gguf"
+                })
+
+    return sorted(models, key=lambda x: x["name"])
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Future-Entropy Sampler (Count Bayesie)")
+    parser.add_argument("--model_path", type=str, help="Path to local safetensors directory or GGUF file")
+    parser.add_argument("--prompt", type=str, default="Once upon a time in a futuristic city,", help="Input prompt")
+    parser.add_argument("--instruct", action="store_true", help="Format prompt with model chat template")
+    parser.add_argument("--max_new_tokens", type=int, default=80, help="Number of tokens to generate")
+    parser.add_argument("--cand_k", type=int, default=8, help="Candidates k to evaluate at each step (default: 8)")
+    parser.add_argument("--top_n", type=int, default=10, help="Top n future tokens for entropy (default: 10)")
+    parser.add_argument("--wavelength", type=float, default=12.0, help="Wavelength of alpha sine wave in tokens (default: 12.0)")
+    parser.add_argument("--amp", type=float, default=0.65, help="Amplitude for alpha wave (default: 0.65)")
+    parser.add_argument("--min_p", type=float, default=0.01, help="Minimum candidate probability to evaluate (default: 0.01)")
+    parser.add_argument("--alpha", type=float, default=None, help="Fixed alpha in [-1.0, 1.0] to test static crossfader without wave")
+    parser.add_argument("--sample", action="store_true", help="Use stochastic multinomial sampling instead of argmax")
+    parser.add_argument("--n_gpu_layers", type=int, default=-1, help="Number of layers to offload to GPU (-1 for all)")
+    parser.add_argument("--verbose_steps", action="store_true", help="Print alpha and selected tokens at each step")
+    args = parser.parse_args()
+    
+    model_path = args.model_path
+    
+    if not model_path:
+        print("No model path provided. Scanning local caches...")
+        models = list_local_models()
+        if not models:
+            print("No models found in HuggingFace, LM Studio, or GPT4All caches. Please provide a path using --model_path.")
+            exit(1)
+            
+        print("\nAvailable models:")
+        for i, m in enumerate(models):
+            print(f"[{i + 1}] {m['name']}")
+            
+        while True:
+            try:
+                choice = input(f"\nSelect a model (1-{len(models)}): ")
+                choice_idx = int(choice) - 1
+                if 0 <= choice_idx < len(models):
+                    model_path = models[choice_idx]['path']
+                    print(f"Selected: {models[choice_idx]['name']}")
+                    break
+                print("Invalid selection.")
+            except (ValueError, KeyboardInterrupt, EOFError):
+                if choice.lower() in ['q', 'quit', 'exit']:
+                    exit(0)
+                print("Please enter a valid number or 'q' to quit.")
+
+    print(f"Loading model from {model_path}...")
+    prompt = args.prompt
+    print(f"Prompt: {prompt}")
+    
+    # Auto-detect if instruct mode is recommended
+    instruct = args.instruct
+    if not instruct and any(sig in model_path.lower() for sig in ['-it', 'instruct', 'chat']):
+        # If the prompt is a question or command rather than an open sentence continuation
+        if prompt.lower().startswith(('write', 'tell', 'explain', 'describe', 'create', 'how', 'what', 'why')):
+            instruct = True
+            print("Auto-detected instruct model with directive prompt. Enabling --instruct format.")
+
+    if os.path.isfile(model_path) and model_path.endswith('.gguf'):
+        try:
+            from llama_cpp import Llama
+        except ImportError:
+            print("Please install llama-cpp-python to run GGUF files.")
+            exit(1)
+            
+        print(f"Loading GGUF model into llama.cpp with n_gpu_layers={args.n_gpu_layers}...")
+        llm = Llama(
+            model_path=model_path, 
+            n_ctx=2048, 
+            n_gpu_layers=args.n_gpu_layers, 
+            logits_all=True, 
+            verbose=False
+        )
+        print("Generating text with future-entropy sampler...")
+        result = future_entropy_sampler_llama(
+            llm, 
+            prompt, 
+            max_new_tokens=args.max_new_tokens,
+            cand_k=args.cand_k,
+            top_n_future=args.top_n,
+            wavelength=args.wavelength,
+            amp=args.amp,
+            min_p=args.min_p,
+            alpha_constant=args.alpha,
+            sample=args.sample,
+            instruct=instruct,
+            verbose_steps=args.verbose_steps
+        )
+    else:
+        print("Generating text with future-entropy sampler using transformers...")
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        
+        device_map = "auto" if torch.cuda.is_available() else None
+        print(f"Using device_map={device_map} for transformers...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, 
+            local_files_only=True,
+            device_map=device_map,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+        )
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        result = future_entropy_sampler(
+            model, 
+            tokenizer, 
+            prompt, 
+            max_new_tokens=args.max_new_tokens,
+            cand_k=args.cand_k,
+            top_n_future=args.top_n,
+            wavelength=args.wavelength,
+            amp=args.amp,
+            min_p=args.min_p,
+            alpha_constant=args.alpha,
+            sample=args.sample,
+            verbose_steps=args.verbose_steps
+        )
+        
+    print("\nResult:\n")
+    print(result)
+
+
+if __name__ == "__main__":
+    main()
