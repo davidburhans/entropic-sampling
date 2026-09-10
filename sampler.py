@@ -645,9 +645,10 @@ def list_local_models():
 
 def main():
     parser = argparse.ArgumentParser(description="Future-Entropy Sampler (Count Bayesie)")
-    parser.add_argument("--model_path", type=str, help="Path to local safetensors directory or GGUF file")
+    parser.add_argument("--model_path", "--model", dest="model_path", type=str, help="Path to local safetensors directory or GGUF file")
     parser.add_argument("--prompt", type=str, default="Once upon a time in a futuristic city,", help="Input prompt")
     parser.add_argument("--instruct", action="store_true", help="Format prompt with model chat template")
+    parser.add_argument("--raw", "--no-instruct", dest="raw", action="store_true", help="Force raw prompt completion without chat template")
     parser.add_argument("--max_new_tokens", type=int, default=80, help="Number of tokens to generate")
     parser.add_argument("--cand_k", type=int, default=8, help="Candidates k to evaluate at each step (default: 8)")
     parser.add_argument("--top_n", type=int, default=10, help="Top n future tokens for entropy (default: 10)")
@@ -702,11 +703,12 @@ def main():
     
     # Auto-detect if instruct mode is recommended
     instruct = args.instruct
-    if not instruct and any(sig in model_path.lower() for sig in ['-it', 'instruct', 'chat']):
-        # If the prompt is a question or command rather than an open sentence continuation
-        if prompt.lower().startswith(('write', 'tell', 'explain', 'describe', 'create', 'how', 'what', 'why')):
+    if not args.raw and not instruct:
+        is_it_model = any(sig in model_path.lower() for sig in ['-it', 'instruct', 'chat'])
+        is_gemma = 'gemma' in model_path.lower()
+        if is_gemma or is_it_model:
             instruct = True
-            print("Auto-detected instruct model with directive prompt. Enabling --instruct format.")
+            print("Auto-detected instruct-tuned model. Enabling chat template formatting (pass --raw to disable).")
 
     stream = not args.no_stream
 

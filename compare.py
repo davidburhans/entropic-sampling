@@ -443,7 +443,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Entropic Sampling Comparison Tool: Benchmark Greedy vs Temperature vs Alpha-Wave Decoding"
     )
-    parser.add_argument("--model_path", type=str, help="Path to local GGUF file or HuggingFace directory")
+    parser.add_argument("--model_path", "--model", dest="model_path", type=str, help="Path to local GGUF file or HuggingFace directory")
     parser.add_argument(
         "--prompt",
         type=str,
@@ -459,6 +459,7 @@ def main():
     parser.add_argument("--wavelength", type=float, default=12.0, help="Wavelength of alpha wave (default: 12.0)")
     parser.add_argument("--amp", type=float, default=1.0, help="Amplitude of alpha wave (default: 1.0)")
     parser.add_argument("--instruct", action="store_true", help="Apply model chat template")
+    parser.add_argument("--raw", "--no-instruct", dest="raw", action="store_true", help="Force raw prompt completion without chat template")
     parser.add_argument("--no_stream", action="store_true", help="Disable real-time token streaming during comparison runs")
     parser.add_argument("--n_gpu_layers", type=int, default=-1, help="Layers to offload to GPU (-1 for all)")
     parser.add_argument("--save_markdown", type=str, default=None, help="Path to write Markdown comparison report")
@@ -495,9 +496,12 @@ def main():
 
     prompt = args.prompt
     instruct = args.instruct
-    if not instruct and any(sig in model_path.lower() for sig in ["-it", "instruct", "chat"]):
-        if prompt.lower().startswith(("write", "tell", "explain", "describe", "create", "how", "what", "why")):
+    if not args.raw and not instruct:
+        is_it_model = any(sig in model_path.lower() for sig in ["-it", "instruct", "chat"])
+        is_gemma = "gemma" in model_path.lower()
+        if is_gemma or is_it_model:
             instruct = True
+            print("Auto-detected instruct-tuned model. Enabling chat template formatting (pass --raw to disable).")
 
     stream = not args.no_stream
 
