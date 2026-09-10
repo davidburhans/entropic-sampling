@@ -469,14 +469,7 @@ def load_llama_model(model_path, n_ctx=2048, n_gpu_layers=-1, seed=None):
     if the model exceeds physical GPU memory.
     """
     from llama_cpp import Llama
-
     arch = get_gguf_architecture(model_path)
-    if arch == "muse-glimmer":
-        raise ValueError(
-            f"Failed to load model '{model_path}': Architecture '{arch}' is a custom/experimental "
-            f"Meta architecture not implemented in upstream llama.cpp. Please load the HuggingFace "
-            f"Transformers version of this model instead."
-        )
 
     layers = calculate_auto_gpu_layers(model_path, requested_layers=n_gpu_layers, n_ctx=n_ctx)
     try:
@@ -504,6 +497,12 @@ def load_llama_model(model_path, n_ctx=2048, n_gpu_layers=-1, seed=None):
                 pass
 
         if arch:
+            if arch == "muse-glimmer":
+                raise RuntimeError(
+                    f"Failed to load GGUF model '{model_path}' (architecture: 'muse-glimmer'). "
+                    f"The 'muse-glimmer' architecture was added in llama.cpp build b10353. "
+                    f"Your llama-cpp-python package must be version 0.3.35+ compiled against llama.cpp b10353+ to load this model."
+                ) from e
             raise RuntimeError(
                 f"Failed to load GGUF model '{model_path}' (architecture: '{arch}'). "
                 f"Ensure the model file is complete and supported by llama.cpp."
@@ -532,12 +531,10 @@ def list_local_models():
         if f.startswith("mmproj") or "mmproj" in f:
             return
 
-        # Skip known non-LLM or unsupported GGUF architectures
+        # Skip known non-LLM architectures (e.g. image diffusion models)
         arch = get_gguf_architecture(full_path)
         if arch in ["lumina2", "qwen_image", "flux", "diffusion", "wan"]:
             return  # Skip image/diffusion models
-        if arch == "muse-glimmer":
-            return  # Skip models with architectures unsupported by llama.cpp
 
         # If multi-part split GGUF (e.g. -00002-of-00005.gguf), only keep the first shard (-00001-of-)
         match = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", f)
