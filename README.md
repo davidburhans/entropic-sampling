@@ -83,11 +83,13 @@ uv run entropic-sampling \
 ```
 
 ### Comparative Benchmark
-Compare the 4 sampling methods side-by-side on the exact same model, prompt, and random seed to see the difference:
+Compare the 4 sampling methods side-by-side on the exact same model, prompt, and random seed to evaluate creativity, coherence, and throughput:
 1. **Greedy Decoding** ($p(w \mid c)$ argmax / Temp 0.0)
 2. **Standard Temperature Sampling** ($T=0.8$, $\text{top-}p=0.95$)
 3. **Static Future-Entropy** ($\alpha = 0.0$ balanced)
 4. **Alpha-Wave Rhythmic Decoding** (oscillating $\alpha \in [-1, 1]$)
+
+Tokens are **streamed live in real-time** as each token is chosen, followed by a **Speed & Throughput Benchmark Table** reporting generation time and tokens per second (`tok/s`):
 
 ```bash
 # Using the dedicated comparison CLI:
@@ -110,7 +112,7 @@ uv run entropic-sampling --compare --prompt "The old clockmaker discovered that 
 | `--model_path` | `str` | `None` | Path to GGUF file or HuggingFace directory |
 | `--prompt` | `str` | `"Once upon a time..."` | Input prompt or story opening |
 | `--instruct` | `flag` | `False` | Apply model chat template with thought channel bypass |
-| `--max_new_tokens` | `int` | `80` | Number of tokens to generate |
+| `--max_new_tokens` | `int` | `80` (`128` in compare) | Number of tokens to generate |
 | `--cand_k` | `int` | `12` | Number of candidates $k$ to consider at each step |
 | `--top_n` | `int` | `10` | Top $n$ future tokens for Shannon entropy |
 | `--wavelength` | `float` | `12.0` | Alpha sine wave wavelength in tokens |
@@ -119,6 +121,7 @@ uv run entropic-sampling --compare --prompt "The old clockmaker discovered that 
 | `--sample` | `flag` | `False` | Use stochastic multinomial sampling instead of argmax |
 | `--n_gpu_layers` | `int` | `-1` | GPU layers offloaded to llama.cpp (-1 for all) |
 | `--verbose_steps` | `flag` | `False` | Print step-by-step alpha, $a$, $b$, and chosen tokens |
+| `--no_stream` | `flag` | `False` | Disable real-time token streaming to stdout |
 | `--compare` | `flag` | `False` | Run comparative benchmark against greedy & temperature |
 
 ---

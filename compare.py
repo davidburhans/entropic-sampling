@@ -26,6 +26,9 @@ def standard_temperature_sampling_llama(
     seed=42,
     instruct=False,
     skip_thought=True,
+    stream=False,
+    stream_callback=None,
+    return_metrics=False,
 ):
     """
     Standard next-token temperature + top-p sampling with llama-cpp-python.
@@ -72,19 +75,29 @@ def standard_temperature_sampling_llama(
             probs = probs / probs_sum if probs_sum > 0 else torch.ones_like(probs) / len(probs)
             chosen_w = torch.multinomial(probs, 1).item()
 
-        generated_tokens.append(chosen_w)
-        llm.eval([chosen_w])
         if chosen_w in stop_tokens:
             break
+
+        generated_tokens.append(chosen_w)
+        llm.eval([chosen_w])
+
+        if stream or stream_callback:
+            piece = llm.detokenize([chosen_w]).decode("utf-8", errors="replace")
+            if callable(stream_callback):
+                stream_callback(piece)
+            elif stream:
+                sys.stdout.write(piece)
+                sys.stdout.flush()
 
     output_text = llm.detokenize(generated_tokens).decode("utf-8", errors="ignore")
     for s in ["<turn|>", "<|im_end|>", "<|eot_id|>", "<end_of_turn>", "</s>", "<eos>"]:
         if output_text.endswith(s):
             output_text = output_text[:-len(s)]
 
-    if instruct:
-        return output_text.strip()
-    return prompt + output_text
+    final_text = output_text.strip() if instruct else (prompt + output_text)
+    if return_metrics:
+        return final_text, len(generated_tokens)
+    return final_text
 
 
 def standard_temperature_sampling_transformers(
@@ -95,6 +108,9 @@ def standard_temperature_sampling_transformers(
     temperature=0.8,
     top_p=0.95,
     seed=42,
+    stream=False,
+    stream_callback=None,
+    return_metrics=False,
 ):
     """
     Standard next-token temperature + top-p sampling with HuggingFace Transformers.
@@ -103,6 +119,7 @@ def standard_temperature_sampling_transformers(
     random.seed(seed)
     device = model.device
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    prompt_len = input_ids.shape[1]
 
     for _ in range(max_new_tokens):
         with torch.no_grad():
@@ -126,11 +143,24 @@ def standard_temperature_sampling_transformers(
                 probs = probs / probs_sum if probs_sum > 0 else torch.ones_like(probs) / len(probs)
                 chosen_w = torch.multinomial(probs, 1).unsqueeze(0)
 
-            input_ids = torch.cat([input_ids, chosen_w], dim=1)
             if chosen_w.item() == tokenizer.eos_token_id:
                 break
 
-    return tokenizer.decode(input_ids[0], skip_special_tokens=True)
+            input_ids = torch.cat([input_ids, chosen_w], dim=1)
+
+            if stream or stream_callback:
+                piece = tokenizer.decode([chosen_w.item()], skip_special_tokens=True)
+                if callable(stream_callback):
+                    stream_callback(piece)
+                elif stream:
+                    sys.stdout.write(piece)
+                    sys.stdout.flush()
+
+    num_generated = input_ids.shape[1] - prompt_len
+    final_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+    if return_metrics:
+        return final_text, num_generated
+    return final_text
 
 
 def run_comparison_llama(
@@ -145,86 +175,82 @@ def run_comparison_llama(
     amp=1.0,
     seed=42,
     instruct=False,
+    stream=True,
 ):
     """
-    Runs all 4 sampling methods under the exact same seed and prompt.
+    Runs all 4 sampling methods under the exact same seed and prompt,
+    streaming token-by-token output to the terminal in real-time.
     """
     results = {}
 
-    # 1. Greedy Decoding (temp = 0.0)
-    print("  [1/4] Generating with Greedy Decoding (p(w|c) argmax)...", flush=True)
-    t0 = time.time()
-    torch.manual_seed(seed)
-    random.seed(seed)
-    out_greedy = standard_temperature_sampling_llama(
-        llm, prompt, max_new_tokens=max_new_tokens, temperature=0.0, seed=seed, instruct=instruct
-    )
-    t_greedy = time.time() - t0
-    results["Greedy (Argmax / Temp 0.0)"] = {
-        "text": out_greedy,
-        "time": t_greedy,
-        "description": "Standard greedy decoding (argmax next-token probability). Frequently funnels into clichés and predictable prose.",
-    }
+    runs = [
+        (
+            "Greedy (Argmax / Temp 0.0)",
+            "[1/4] Greedy Decoding (p(w|c) argmax)",
+            "Standard greedy decoding (argmax next-token probability). Frequently funnels into clichés and predictable prose.",
+            lambda: standard_temperature_sampling_llama(
+                llm, prompt, max_new_tokens=max_new_tokens, temperature=0.0, seed=seed,
+                instruct=instruct, stream=stream, return_metrics=True
+            ),
+        ),
+        (
+            f"Standard Sampling (Temp {temperature}, Top-p {top_p})",
+            f"[2/4] Standard Temperature Sampling (T={temperature}, top-p={top_p})",
+            f"Traditional stochastic sampling from the scaled next-token distribution with top-p={top_p}.",
+            lambda: standard_temperature_sampling_llama(
+                llm, prompt, max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p, seed=seed,
+                instruct=instruct, stream=stream, return_metrics=True
+            ),
+        ),
+        (
+            "Static Future-Entropy (alpha = 0.0)",
+            "[3/4] Static Future-Entropy (alpha = 0.0 balanced)",
+            "Crossfader balance s(w) = p(w|c) * H_hat(w). Weights high future optionality at every token.",
+            lambda: future_entropy_sampler_llama(
+                llm, prompt, max_new_tokens=max_new_tokens, cand_k=cand_k, top_n_future=top_n_future,
+                alpha_constant=0.0, sample=False, instruct=instruct, stream=stream, return_metrics=True
+            ),
+        ),
+        (
+            "Alpha-Wave Rhythmic Decoding (Sine Wave)",
+            f"[4/4] Alpha-Wave Rhythmic Decoding (wavelength={wavelength}, amp={amp})",
+            f"Sinusoidal oscillation of alpha in [-{amp}, +{amp}] with wavelength={wavelength} tokens. Natural breathing cadence between anchors and creative leaps.",
+            lambda: future_entropy_sampler_llama(
+                llm, prompt, max_new_tokens=max_new_tokens, cand_k=cand_k, top_n_future=top_n_future,
+                wavelength=wavelength, amp=amp, sample=False, instruct=instruct, stream=stream, return_metrics=True
+            ),
+        ),
+    ]
 
-    # 2. Standard Temperature Sampling (temp = 0.8)
-    print(f"  [2/4] Generating with Standard Temperature Sampling (T={temperature}, top-p={top_p})...", flush=True)
-    t0 = time.time()
-    torch.manual_seed(seed)
-    random.seed(seed)
-    out_temp = standard_temperature_sampling_llama(
-        llm, prompt, max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p, seed=seed, instruct=instruct
-    )
-    t_temp = time.time() - t0
-    results[f"Standard Sampling (Temp {temperature}, Top-p {top_p})"] = {
-        "text": out_temp,
-        "time": t_temp,
-        "description": f"Traditional stochastic sampling from the scaled next-token distribution with top-p={top_p}.",
-    }
+    for key, title, desc, run_fn in runs:
+        print("\n" + "=" * 80)
+        print(f" {title} ".center(80, "-"))
+        print("=" * 80)
+        if stream and not instruct:
+            if sys.stdout.isatty():
+                sys.stdout.write(f"\033[90m{prompt}\033[0m")
+            else:
+                sys.stdout.write(prompt)
+            sys.stdout.flush()
 
-    # 3. Static Future-Entropy (alpha = 0.0)
-    print("  [3/4] Generating with Static Future-Entropy (alpha = 0.0 balanced)...", flush=True)
-    t0 = time.time()
-    torch.manual_seed(seed)
-    random.seed(seed)
-    out_static = future_entropy_sampler_llama(
-        llm,
-        prompt,
-        max_new_tokens=max_new_tokens,
-        cand_k=cand_k,
-        top_n_future=top_n_future,
-        alpha_constant=0.0,
-        sample=False,
-        instruct=instruct,
-    )
-    t_static = time.time() - t0
-    results["Static Future-Entropy (alpha = 0.0)"] = {
-        "text": out_static,
-        "time": t_static,
-        "description": "Crossfader balance s(w) = p(w|c) * H_hat(w). Weights high future optionality at every token.",
-    }
+        t0 = time.time()
+        torch.manual_seed(seed)
+        random.seed(seed)
+        text, n_tokens = run_fn()
+        elapsed = time.time() - t0
+        tok_per_sec = n_tokens / elapsed if elapsed > 0 else 0.0
 
-    # 4. Alpha-Wave Rhythmic Decoding
-    print(f"  [4/4] Generating with Alpha-Wave Rhythmic Decoding (wavelength={wavelength}, amp={amp})...", flush=True)
-    t0 = time.time()
-    torch.manual_seed(seed)
-    random.seed(seed)
-    out_wave = future_entropy_sampler_llama(
-        llm,
-        prompt,
-        max_new_tokens=max_new_tokens,
-        cand_k=cand_k,
-        top_n_future=top_n_future,
-        wavelength=wavelength,
-        amp=amp,
-        sample=False,
-        instruct=instruct,
-    )
-    t_wave = time.time() - t0
-    results["Alpha-Wave Rhythmic Decoding (Sine Wave)"] = {
-        "text": out_wave,
-        "time": t_wave,
-        "description": f"Sinusoidal oscillation of alpha in [-{amp}, +{amp}] with wavelength={wavelength} tokens. Natural breathing cadence between anchors and creative leaps.",
-    }
+        if stream:
+            print()
+        print(f"\n[Completed: {n_tokens} tokens in {elapsed:.2f}s ({tok_per_sec:.1f} tok/s)]")
+
+        results[key] = {
+            "text": text,
+            "time": elapsed,
+            "tokens": n_tokens,
+            "speed": tok_per_sec,
+            "description": desc,
+        }
 
     return results
 
@@ -241,106 +267,144 @@ def run_comparison_transformers(
     wavelength=12.0,
     amp=1.0,
     seed=42,
+    stream=True,
 ):
     """
-    Runs all 4 sampling methods with HuggingFace Transformers.
+    Runs all 4 sampling methods with HuggingFace Transformers,
+    streaming token-by-token output to the terminal in real-time.
     """
     results = {}
 
-    print("  [1/4] Generating with Greedy Decoding (Temp 0.0)...", flush=True)
-    t0 = time.time()
-    out_greedy = standard_temperature_sampling_transformers(
-        model, tokenizer, prompt, max_new_tokens=max_new_tokens, temperature=0.0, seed=seed
-    )
-    results["Greedy (Argmax / Temp 0.0)"] = {
-        "text": out_greedy,
-        "time": time.time() - t0,
-        "description": "Standard greedy decoding (argmax next-token probability).",
-    }
+    runs = [
+        (
+            "Greedy (Argmax / Temp 0.0)",
+            "[1/4] Greedy Decoding (p(w|c) argmax)",
+            "Standard greedy decoding (argmax next-token probability).",
+            lambda: standard_temperature_sampling_transformers(
+                model, tokenizer, prompt, max_new_tokens=max_new_tokens, temperature=0.0, seed=seed,
+                stream=stream, return_metrics=True
+            ),
+        ),
+        (
+            f"Standard Sampling (Temp {temperature}, Top-p {top_p})",
+            f"[2/4] Standard Temperature Sampling (T={temperature}, top-p={top_p})",
+            f"Traditional stochastic sampling with temperature={temperature}.",
+            lambda: standard_temperature_sampling_transformers(
+                model, tokenizer, prompt, max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p, seed=seed,
+                stream=stream, return_metrics=True
+            ),
+        ),
+        (
+            "Static Future-Entropy (alpha = 0.0)",
+            "[3/4] Static Future-Entropy (alpha = 0.0 balanced)",
+            "Crossfader balance s(w) = p(w|c) * H_hat(w).",
+            lambda: future_entropy_sampler(
+                model, tokenizer, prompt, max_new_tokens=max_new_tokens, cand_k=cand_k, top_n_future=top_n_future,
+                alpha_constant=0.0, sample=False, stream=stream, return_metrics=True
+            ),
+        ),
+        (
+            "Alpha-Wave Rhythmic Decoding (Sine Wave)",
+            f"[4/4] Alpha-Wave Rhythmic Decoding (wavelength={wavelength}, amp={amp})",
+            f"Sinusoidal alpha wave (wavelength={wavelength}, amp={amp}).",
+            lambda: future_entropy_sampler(
+                model, tokenizer, prompt, max_new_tokens=max_new_tokens, cand_k=cand_k, top_n_future=top_n_future,
+                wavelength=wavelength, amp=amp, sample=False, stream=stream, return_metrics=True
+            ),
+        ),
+    ]
 
-    print(f"  [2/4] Generating with Standard Temperature Sampling (T={temperature})...", flush=True)
-    t0 = time.time()
-    out_temp = standard_temperature_sampling_transformers(
-        model, tokenizer, prompt, max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p, seed=seed
-    )
-    results[f"Standard Sampling (Temp {temperature}, Top-p {top_p})"] = {
-        "text": out_temp,
-        "time": time.time() - t0,
-        "description": f"Traditional stochastic sampling with temperature={temperature}.",
-    }
+    for key, title, desc, run_fn in runs:
+        print("\n" + "=" * 80)
+        print(f" {title} ".center(80, "-"))
+        print("=" * 80)
+        if stream:
+            if sys.stdout.isatty():
+                sys.stdout.write(f"\033[90m{prompt}\033[0m")
+            else:
+                sys.stdout.write(prompt)
+            sys.stdout.flush()
 
-    print("  [3/4] Generating with Static Future-Entropy (alpha = 0.0)...", flush=True)
-    t0 = time.time()
-    torch.manual_seed(seed)
-    random.seed(seed)
-    out_static = future_entropy_sampler(
-        model,
-        tokenizer,
-        prompt,
-        max_new_tokens=max_new_tokens,
-        cand_k=cand_k,
-        top_n_future=top_n_future,
-        alpha_constant=0.0,
-        sample=False,
-    )
-    results["Static Future-Entropy (alpha = 0.0)"] = {
-        "text": out_static,
-        "time": time.time() - t0,
-        "description": "Balanced crossfader s(w) = p(w|c) * H_hat(w).",
-    }
+        t0 = time.time()
+        torch.manual_seed(seed)
+        random.seed(seed)
+        text, n_tokens = run_fn()
+        elapsed = time.time() - t0
+        tok_per_sec = n_tokens / elapsed if elapsed > 0 else 0.0
 
-    print("  [4/4] Generating with Alpha-Wave Rhythmic Decoding...", flush=True)
-    t0 = time.time()
-    torch.manual_seed(seed)
-    random.seed(seed)
-    out_wave = future_entropy_sampler(
-        model,
-        tokenizer,
-        prompt,
-        max_new_tokens=max_new_tokens,
-        cand_k=cand_k,
-        top_n_future=top_n_future,
-        wavelength=wavelength,
-        amp=amp,
-        sample=False,
-    )
-    results["Alpha-Wave Rhythmic Decoding (Sine Wave)"] = {
-        "text": out_wave,
-        "time": time.time() - t0,
-        "description": f"Sinusoidal alpha wave (wavelength={wavelength}, amp={amp}).",
-    }
+        if stream:
+            print()
+        print(f"\n[Completed: {n_tokens} tokens in {elapsed:.2f}s ({tok_per_sec:.1f} tok/s)]")
+
+        results[key] = {
+            "text": text,
+            "time": elapsed,
+            "tokens": n_tokens,
+            "speed": tok_per_sec,
+            "description": desc,
+        }
 
     return results
 
 
 def print_comparison(results, prompt, seed):
     """
-    Renders a formatted comparison in the terminal.
+    Renders a formatted comparison table and output cards in the terminal.
     """
     width = 80
     sep = "=" * width
     subsep = "-" * width
 
     print(f"\n{sep}")
-    print(" SAMPLING COMPARISON BENCHMARK ".center(width, "#"))
+    print(" SAMPLING COMPARISON BENCHMARK SUMMARY ".center(width, "#"))
     print(sep)
     print(f"Prompt: {repr(prompt)}")
     print(f"Random Seed: {seed}")
     print(f"{sep}\n")
 
+    # 1. Throughput & Speed Comparison Table
+    print(f"{sep}")
+    print(" THROUGHPUT & SPEED BENCHMARK ".center(width, "#"))
+    print(sep)
+    first_key = next(iter(results))
+    baseline_speed = results[first_key].get("speed", 1.0)
+
+    header = f"{'Method':<40} {'Tokens':>7} {'Time':>8} {'Speed (tok/s)':>14} {'vs Baseline':>12}"
+    print(header)
+    print(subsep)
+    for title, data in results.items():
+        toks = data.get("tokens", 0)
+        t = data.get("time", 0.0)
+        spd = data.get("speed", 0.0)
+        rel = (spd / baseline_speed) if baseline_speed > 0 else 1.0
+        rel_str = f"{rel:.2f}x" if title != first_key else "1.00x (base)"
+        print(f"{title:<40} {toks:>7d} {t:>7.2f}s {spd:>12.1f} tok/s {rel_str:>12}")
+    print(f"{sep}\n")
+
+    # 2. Text outputs
+    print(f"{sep}")
+    print(" GENERATED TEXT OUTPUTS ".center(width, "#"))
+    print(sep)
     for idx, (title, data) in enumerate(results.items(), start=1):
-        print(f"[{idx}] {title.upper()}")
+        toks = data.get("tokens", 0)
+        t = data.get("time", 0.0)
+        spd = data.get("speed", 0.0)
+        print(f"\n[{idx}] {title.upper()}")
         print(f"    Rationale: {data['description']}")
-        print(f"    Generation time: {data['time']:.2f}s")
+        print(f"    Tokens: {toks} | Elapsed Time: {t:.2f}s | Speed: {spd:.1f} tok/s")
         print(subsep)
         print(data["text"])
-        print(f"{subsep}\n")
+        print(f"{subsep}")
+    print(f"\n{sep}\n")
 
 
 def save_markdown_report(filepath, results, prompt, seed, model_name):
     """
-    Saves a comparison report as GitHub-Flavored Markdown.
+    Saves a comparison report with speed table as GitHub-Flavored Markdown.
     """
+    first_key = next(iter(results))
+    baseline_speed = results[first_key].get("speed", 1.0)
+
     with open(filepath, "w", encoding="utf-8") as f:
         f.write("# Entropic Sampling: Comparative Benchmark\n\n")
         f.write(f"- **Model:** `{model_name}`\n")
@@ -348,10 +412,26 @@ def save_markdown_report(filepath, results, prompt, seed, model_name):
         f.write(f"- **Seed:** `{seed}`\n\n")
         f.write("---\n\n")
 
+        f.write("## Throughput & Speed Benchmark\n\n")
+        f.write("| Sampling Method | Tokens | Generation Time | Speed (tok/s) | Relative Speed |\n")
+        f.write("|---|---|---|---|---|\n")
         for title, data in results.items():
-            f.write(f"### {title}\n\n")
+            toks = data.get("tokens", 0)
+            t = data.get("time", 0.0)
+            spd = data.get("speed", 0.0)
+            rel = (spd / baseline_speed) if baseline_speed > 0 else 1.0
+            rel_str = f"{rel:.2f}x" if title != first_key else "1.00x (baseline)"
+            f.write(f"| **{title}** | {toks} | {t:.2f}s | **{spd:.1f} tok/s** | {rel_str} |\n")
+        f.write("\n---\n\n")
+
+        f.write("## Detailed Generated Outputs\n\n")
+        for idx, (title, data) in enumerate(results.items(), start=1):
+            toks = data.get("tokens", 0)
+            t = data.get("time", 0.0)
+            spd = data.get("speed", 0.0)
+            f.write(f"### {idx}. {title}\n\n")
             f.write(f"> *{data['description']}*  \n")
-            f.write(f"> **Elapsed Time:** {data['time']:.2f}s\n\n")
+            f.write(f"> **Tokens:** {toks} | **Generation Time:** {t:.2f}s | **Speed:** {spd:.1f} tok/s\n\n")
             f.write("```text\n")
             f.write(data["text"])
             f.write("\n```\n\n")
@@ -379,6 +459,7 @@ def main():
     parser.add_argument("--wavelength", type=float, default=12.0, help="Wavelength of alpha wave (default: 12.0)")
     parser.add_argument("--amp", type=float, default=1.0, help="Amplitude of alpha wave (default: 1.0)")
     parser.add_argument("--instruct", action="store_true", help="Apply model chat template")
+    parser.add_argument("--no_stream", action="store_true", help="Disable real-time token streaming during comparison runs")
     parser.add_argument("--n_gpu_layers", type=int, default=-1, help="Layers to offload to GPU (-1 for all)")
     parser.add_argument("--save_markdown", type=str, default=None, help="Path to write Markdown comparison report")
     args = parser.parse_args()
@@ -418,10 +499,13 @@ def main():
         if prompt.lower().startswith(("write", "tell", "explain", "describe", "create", "how", "what", "why")):
             instruct = True
 
+    stream = not args.no_stream
+
     print(f"\nTarget Model: {model_path}")
     print(f"Prompt: {repr(prompt)}")
     print(f"Seed: {args.seed}")
-    print(f"Max New Tokens: {args.max_new_tokens}\n")
+    print(f"Max New Tokens: {args.max_new_tokens}")
+    print(f"Streaming: {'Enabled' if stream else 'Disabled'}\n")
     print("Beginning comparative sampling runs...\n")
 
     if os.path.isfile(model_path) and model_path.endswith(".gguf"):
@@ -444,6 +528,7 @@ def main():
             amp=args.amp,
             seed=args.seed,
             instruct=instruct,
+            stream=stream,
         )
     else:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -480,6 +565,7 @@ def main():
             wavelength=args.wavelength,
             amp=args.amp,
             seed=args.seed,
+            stream=stream,
         )
 
     print_comparison(results, prompt, args.seed)

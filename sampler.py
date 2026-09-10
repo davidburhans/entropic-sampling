@@ -1,4 +1,6 @@
 import os
+import sys
+import time
 import math
 import argparse
 import torch
@@ -73,12 +75,15 @@ def future_entropy_sampler(
     max_new_tokens=80, 
     cand_k=8, 
     top_n_future=10, 
-    wavelength=12.0,
-    amp=0.65,
+    wavelength=12.0, 
+    amp=0.65, 
     min_p=0.01,
     alpha_constant=None,
     sample=False,
-    verbose_steps=False
+    verbose_steps=False,
+    stream=False,
+    stream_callback=None,
+    return_metrics=False,
 ):
     """
     Generates text using the future-entropy sampler with alpha-wave rhythmic decoding
@@ -101,9 +106,16 @@ def future_entropy_sampler(
             mask = top_k_w_probs >= min_p
             if not mask.any():
                 chosen_w = top_k_w_indices[0]
-                input_ids = torch.cat([input_ids, chosen_w.unsqueeze(0).unsqueeze(0)], dim=1)
                 if chosen_w.item() == tokenizer.eos_token_id:
                     break
+                input_ids = torch.cat([input_ids, chosen_w.unsqueeze(0).unsqueeze(0)], dim=1)
+                if stream or stream_callback:
+                    piece = tokenizer.decode([chosen_w.item()], skip_special_tokens=True)
+                    if callable(stream_callback):
+                        stream_callback(piece)
+                    elif stream:
+                        sys.stdout.write(piece)
+                        sys.stdout.flush()
                 continue
                 
             top_k_w_probs = top_k_w_probs[mask]
@@ -147,12 +159,24 @@ def future_entropy_sampler(
                 tok_str = tokenizer.decode([chosen_w.item()])
                 print(f"[Step {step:02d}] alpha={alpha:+.2f} (a={a:.2f}, b={b:.2f}) -> chosen={repr(tok_str)}")
                 
-            input_ids = torch.cat([input_ids, chosen_w.unsqueeze(0).unsqueeze(0)], dim=1)
-            
             if chosen_w.item() == tokenizer.eos_token_id:
                 break
-                
-    return tokenizer.decode(input_ids[0], skip_special_tokens=True)
+
+            input_ids = torch.cat([input_ids, chosen_w.unsqueeze(0).unsqueeze(0)], dim=1)
+
+            if stream or stream_callback:
+                piece = tokenizer.decode([chosen_w.item()], skip_special_tokens=True)
+                if callable(stream_callback):
+                    stream_callback(piece)
+                elif stream:
+                    sys.stdout.write(piece)
+                    sys.stdout.flush()
+
+    num_generated = input_ids.shape[1] - prompt_len
+    final_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+    if return_metrics:
+        return final_text, num_generated
+    return final_text
 
 
 def future_entropy_sampler_llama(
@@ -168,7 +192,10 @@ def future_entropy_sampler_llama(
     sample=False,
     instruct=False,
     skip_thought=True,
-    verbose_steps=False
+    verbose_steps=False,
+    stream=False,
+    stream_callback=None,
+    return_metrics=False,
 ):
     """
     Generates text using the future-entropy sampler with alpha-wave rhythmic decoding
@@ -220,10 +247,17 @@ def future_entropy_sampler_llama(
         mask = topk.values >= min_p
         if not mask.any():
             chosen_w = topk.indices[0].item()
-            generated_tokens.append(chosen_w)
-            llm.eval([chosen_w])
             if chosen_w in stop_tokens:
                 break
+            generated_tokens.append(chosen_w)
+            llm.eval([chosen_w])
+            if stream or stream_callback:
+                piece = llm.detokenize([chosen_w]).decode('utf-8', errors='replace')
+                if callable(stream_callback):
+                    stream_callback(piece)
+                elif stream:
+                    sys.stdout.write(piece)
+                    sys.stdout.flush()
             continue
 
         top_k_w_probs = topk.values[mask]
@@ -279,11 +313,19 @@ def future_entropy_sampler_llama(
             tok_str = llm.detokenize([chosen_w]).decode('utf-8', errors='ignore')
             print(f"[Step {step:02d}] alpha={alpha:+.2f} (a={a:.2f}, b={b:.2f}) -> chosen={repr(tok_str)}")
             
-        generated_tokens.append(chosen_w)
-        llm.eval([chosen_w])
-        
         if chosen_w in stop_tokens:
             break
+
+        generated_tokens.append(chosen_w)
+        llm.eval([chosen_w])
+
+        if stream or stream_callback:
+            piece = llm.detokenize([chosen_w]).decode('utf-8', errors='replace')
+            if callable(stream_callback):
+                stream_callback(piece)
+            elif stream:
+                sys.stdout.write(piece)
+                sys.stdout.flush()
             
     output_text = llm.detokenize(generated_tokens).decode('utf-8', errors='ignore')
     
@@ -292,10 +334,10 @@ def future_entropy_sampler_llama(
         if output_text.endswith(s):
             output_text = output_text[:-len(s)]
             
-    if instruct:
-        return output_text.strip()
-    else:
-        return prompt + output_text
+    final_text = output_text.strip() if instruct else (prompt + output_text)
+    if return_metrics:
+        return final_text, len(generated_tokens)
+    return final_text
 
 
 def get_model_size_bytes(model_path):
@@ -619,6 +661,7 @@ def main():
     parser.add_argument("--sample", action="store_true", help="Use stochastic multinomial sampling instead of argmax")
     parser.add_argument("--n_gpu_layers", type=int, default=-1, help="Number of layers to offload to GPU (-1 for all)")
     parser.add_argument("--verbose_steps", action="store_true", help="Print alpha and selected tokens at each step")
+    parser.add_argument("--no_stream", action="store_true", help="Disable real-time token streaming")
     parser.add_argument("--compare", action="store_true", help="Run comparative benchmark (Greedy vs Temperature vs Alpha-Wave)")
     args, unknown = parser.parse_known_args()
     
@@ -668,6 +711,8 @@ def main():
             instruct = True
             print("Auto-detected instruct model with directive prompt. Enabling --instruct format.")
 
+    stream = not args.no_stream
+
     if os.path.isfile(model_path) and model_path.endswith('.gguf'):
         try:
             from llama_cpp import Llama
@@ -681,8 +726,18 @@ def main():
             n_ctx=2048, 
             n_gpu_layers=args.n_gpu_layers, 
         )
-        print("Generating text with future-entropy sampler...")
-        result = future_entropy_sampler_llama(
+        if not stream:
+            print("Generating text with future-entropy sampler...")
+        else:
+            if not instruct:
+                if sys.stdout.isatty():
+                    sys.stdout.write(f"\033[90m{prompt}\033[0m")
+                else:
+                    sys.stdout.write(prompt)
+                sys.stdout.flush()
+
+        t0 = time.time()
+        result, num_tokens = future_entropy_sampler_llama(
             llm, 
             prompt, 
             max_new_tokens=args.max_new_tokens,
@@ -694,10 +749,11 @@ def main():
             alpha_constant=args.alpha,
             sample=args.sample,
             instruct=instruct,
-            verbose_steps=args.verbose_steps
+            verbose_steps=args.verbose_steps,
+            stream=stream,
+            return_metrics=True,
         )
     else:
-        print("Generating text with future-entropy sampler using transformers...")
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         
         if torch.cuda.is_available():
@@ -719,7 +775,19 @@ def main():
         )
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
-        result = future_entropy_sampler(
+
+        if not stream:
+            print("Generating text with future-entropy sampler using transformers...")
+        else:
+            if not instruct:
+                if sys.stdout.isatty():
+                    sys.stdout.write(f"\033[90m{prompt}\033[0m")
+                else:
+                    sys.stdout.write(prompt)
+                sys.stdout.flush()
+
+        t0 = time.time()
+        result, num_tokens = future_entropy_sampler(
             model, 
             tokenizer, 
             prompt, 
@@ -731,11 +799,20 @@ def main():
             min_p=args.min_p,
             alpha_constant=args.alpha,
             sample=args.sample,
-            verbose_steps=args.verbose_steps
+            verbose_steps=args.verbose_steps,
+            stream=stream,
+            return_metrics=True,
         )
         
-    print("\nResult:\n")
-    print(result)
+    elapsed = time.time() - t0
+    tok_per_sec = num_tokens / elapsed if elapsed > 0 else 0.0
+
+    if stream:
+        print(f"\n\n[Finished: {num_tokens} tokens generated in {elapsed:.2f}s ({tok_per_sec:.1f} tok/s)]\n")
+    else:
+        print("\nResult:\n")
+        print(result)
+        print(f"\n[Finished: {num_tokens} tokens generated in {elapsed:.2f}s ({tok_per_sec:.1f} tok/s)]\n")
 
 
 if __name__ == "__main__":
