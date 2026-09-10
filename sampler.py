@@ -300,13 +300,47 @@ def future_entropy_sampler_llama(
 
 def list_local_models():
     """
-    Scans HuggingFace, LM Studio, and GPT4All caches for usable models,
+    Scans standard local caches across platforms (Linux, macOS, Windows)
+    and optional user directories (MODELS_DIR) for usable GGUF or Transformers models,
     excluding multimodal projectors (mmproj).
     """
     models = []
-    
-    # 1. HuggingFace Cache
-    hf_cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+    seen_paths = set()
+
+    def add_model(name, path, mtype):
+        real = os.path.realpath(path)
+        if real not in seen_paths and os.path.exists(path):
+            seen_paths.add(real)
+            models.append({"name": name, "path": path, "type": mtype})
+
+    # 1. Custom / local directories via environment variable or current ./models dir
+    custom_dirs = []
+    if os.environ.get("MODELS_DIR"):
+        custom_dirs.append(os.environ["MODELS_DIR"])
+    if os.environ.get("MODEL_DIRS"):
+        custom_dirs.extend(os.environ["MODEL_DIRS"].split(os.pathsep))
+    if os.path.isdir("models"):
+        custom_dirs.append(os.path.abspath("models"))
+
+    for cdir in custom_dirs:
+        cdir = os.path.expanduser(cdir)
+        if os.path.isdir(cdir):
+            for root, _, files in os.walk(cdir):
+                for f in files:
+                    if f.endswith('.gguf') and not f.startswith('mmproj') and 'mmproj' not in f:
+                        rel = os.path.relpath(os.path.join(root, f), cdir)
+                        add_model(f"[Local Dir] {rel}", os.path.join(root, f), "gguf")
+                if os.path.exists(os.path.join(root, "config.json")):
+                    rel = os.path.relpath(root, cdir)
+                    add_model(f"[Local Transformers] {rel}", root, "transformers")
+
+    # 2. HuggingFace Cache (respects HF_HOME if set)
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        hf_cache_dir = os.path.join(os.path.expanduser(hf_home), "hub")
+    else:
+        hf_cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+
     if os.path.exists(hf_cache_dir):
         for item in os.listdir(hf_cache_dir):
             if item.startswith("models--"):
@@ -320,42 +354,52 @@ def list_local_models():
                             for f in files:
                                 if f.endswith('.gguf') and not f.startswith('mmproj') and 'mmproj' not in f:
                                     rel = os.path.relpath(os.path.join(root, f), snap_path)
-                                    models.append({
-                                        "name": f"[HF GGUF] {model_name} ({rel})",
-                                        "path": os.path.join(root, f),
-                                        "type": "gguf"
-                                    })
+                                    add_model(f"[HF GGUF] {model_name} ({rel})", os.path.join(root, f), "gguf")
                                     found_gguf = True
                         if not found_gguf and os.path.exists(os.path.join(snap_path, "config.json")):
-                            models.append({
-                                "name": f"[HF Transformers] {model_name}",
-                                "path": snap_path,
-                                "type": "transformers"
-                            })
+                            add_model(f"[HF Transformers] {model_name}", snap_path, "transformers")
 
-    # 2. LM Studio Cache
-    lm_studio_dir = os.path.expanduser("~/.cache/lm-studio/models")
-    if os.path.exists(lm_studio_dir):
-        for root, _, files in os.walk(lm_studio_dir):
+    # 3. LM Studio Caches (Linux, macOS, Windows)
+    lm_candidates = [
+        os.path.expanduser("~/.cache/lm-studio/models"),
+        os.path.expanduser("~/Library/Application Support/LM-Studio/models"),
+        os.path.expanduser("~/.lmstudio/models"),
+    ]
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        lm_candidates.append(os.path.join(appdata, "LM-Studio", "models"))
+
+    for lm_studio_dir in lm_candidates:
+        if os.path.exists(lm_studio_dir):
+            for root, _, files in os.walk(lm_studio_dir):
+                for file in files:
+                    if file.endswith(".gguf") and not file.startswith('mmproj') and 'mmproj' not in file:
+                        rel_path = os.path.relpath(root, lm_studio_dir)
+                        add_model(f"[LM Studio] {rel_path}/{file}", os.path.join(root, file), "gguf")
+
+    # 4. GPT4All Caches (Linux, macOS, Windows)
+    gpt4all_candidates = [
+        os.path.expanduser("~/.local/share/nomic.ai/GPT4All/"),
+        os.path.expanduser("~/Library/Application Support/nomic.ai/GPT4All/"),
+    ]
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if localappdata:
+        gpt4all_candidates.append(os.path.join(localappdata, "nomic.ai", "GPT4All"))
+
+    for gpt4all_dir in gpt4all_candidates:
+        if os.path.exists(gpt4all_dir):
+            for file in os.listdir(gpt4all_dir):
+                if file.endswith(".gguf") and not file.startswith('mmproj') and 'mmproj' not in file:
+                    add_model(f"[GPT4All] {file}", os.path.join(gpt4all_dir, file), "gguf")
+
+    # 5. Ollama models directory (OLLAMA_MODELS or default)
+    ollama_dir = os.environ.get("OLLAMA_MODELS", os.path.expanduser("~/.ollama/models"))
+    if os.path.exists(ollama_dir):
+        for root, _, files in os.walk(ollama_dir):
             for file in files:
                 if file.endswith(".gguf") and not file.startswith('mmproj') and 'mmproj' not in file:
-                    rel_path = os.path.relpath(root, lm_studio_dir)
-                    models.append({
-                        "name": f"[LM Studio] {rel_path}/{file}",
-                        "path": os.path.join(root, file),
-                        "type": "gguf"
-                    })
-
-    # 3. GPT4All Cache
-    gpt4all_dir = os.path.expanduser("~/.local/share/nomic.ai/GPT4All/")
-    if os.path.exists(gpt4all_dir):
-        for file in os.listdir(gpt4all_dir):
-            if file.endswith(".gguf") and not file.startswith('mmproj') and 'mmproj' not in file:
-                models.append({
-                    "name": f"[GPT4All] {file}",
-                    "path": os.path.join(gpt4all_dir, file),
-                    "type": "gguf"
-                })
+                    rel_path = os.path.relpath(os.path.join(root, file), ollama_dir)
+                    add_model(f"[Ollama] {rel_path}", os.path.join(root, file), "gguf")
 
     return sorted(models, key=lambda x: x["name"])
 
@@ -450,13 +494,22 @@ def main():
         print("Generating text with future-entropy sampler using transformers...")
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         
-        device_map = "auto" if torch.cuda.is_available() else None
-        print(f"Using device_map={device_map} for transformers...")
+        if torch.cuda.is_available():
+            device_map = "auto"
+            dtype = torch.float16
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device_map = "mps"
+            dtype = torch.float16
+        else:
+            device_map = None
+            dtype = torch.float32
+
+        print(f"Using device_map={device_map}, dtype={dtype} for transformers...")
         model = AutoModelForCausalLM.from_pretrained(
             model_path, 
             local_files_only=True,
             device_map=device_map,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+            torch_dtype=dtype
         )
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token

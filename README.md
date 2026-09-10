@@ -30,13 +30,33 @@ The **Future-Entropy Sampler** looks one step ahead:
 
 ---
 
+## Installation
+
+Clone the repository and install dependencies with [`uv`](https://github.com/astral-sh/uv):
+
+```bash
+git clone https://github.com/davidburhans/entropic-sampling.git
+cd entropic-sampling
+uv sync
+```
+
+### GPU Acceleration (Optional)
+
+- **Apple Silicon (macOS Metal):** Supported out-of-the-box by standard wheels.
+- **NVIDIA GPU (CUDA):** To compile `llama-cpp-python` with CUDA acceleration:
+  ```bash
+  CMAKE_ARGS="-DGGML_CUDA=on" uv pip install --no-binary llama-cpp-python llama-cpp-python
+  ```
+
+---
+
 ## Quickstart
 
 ### Interactive Model Selection
 ```bash
 uv run python sampler.py
 ```
-Scans your local caches (HuggingFace Hub, LM Studio, GPT4All) for compatible models and presents an interactive menu.
+Scans standard local caches (HuggingFace Hub, LM Studio, GPT4All, Ollama, or custom directory set via `MODELS_DIR`) for compatible models and presents an interactive selection menu.
 
 ### Direct Command Line Run
 ```bash
@@ -80,3 +100,20 @@ uv run python sampler.py \
 | `--sample` | `flag` | `False` | Use stochastic multinomial sampling instead of argmax |
 | `--n_gpu_layers` | `int` | `-1` | GPU layers offloaded to llama.cpp (-1 for all) |
 | `--verbose_steps` | `flag` | `False` | Print step-by-step alpha, $a$, $b$, and chosen tokens |
+
+---
+
+## Testing & Verification
+
+- **List Detected Local Models:**
+  ```bash
+  uv run python verify_models.py
+  ```
+- **Test Generation (auto-detects or accepts model path):**
+  ```bash
+  uv run python test_generation.py [/path/to/model.gguf] ["Optional prompt"]
+  ```
+- **Test llama.cpp Lookahead State Restoration:**
+  ```bash
+  uv run python test_llama.py [/path/to/model.gguf]
+  ```
