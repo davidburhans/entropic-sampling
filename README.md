@@ -54,14 +54,14 @@ uv sync
 
 ### Interactive Model Selection
 ```bash
-uv run python sampler.py
+uv run entropic-sampling
 ```
 Scans standard local caches (HuggingFace Hub, LM Studio, GPT4All, Ollama, or custom directory set via `MODELS_DIR`) for compatible models and presents an interactive selection menu.
 
 ### Direct Command Line Run
 ```bash
 # Creative continuation with Gemma 4 or Qwen GGUF
-uv run python sampler.py \
+uv run entropic-sampling \
   --model_path /path/to/model.gguf \
   --prompt "Once upon a time in a futuristic city," \
   --max_new_tokens 80 \
@@ -75,7 +75,7 @@ uv run python sampler.py \
 ### Instruct Mode
 For instruction-tuned models with a specific task:
 ```bash
-uv run python sampler.py \
+uv run entropic-sampling \
   --model_path /path/to/model.gguf \
   --prompt "Write the opening of a ghost story set in an old lighthouse." \
   --instruct \
