@@ -360,19 +360,11 @@ def calculate_auto_gpu_layers(model_path, requested_layers=-1, n_ctx=2048):
         return -1  # Fits completely in GPU VRAM
 
     # Model exceeds free VRAM. Inspect block_count from GGUF metadata
-    block_count = 32  # standard default fallback
-    try:
-        from gguf import GGUFReader
-        reader = GGUFReader(model_path)
-        arch = None
-        for f in reader.fields.values():
-            if f.name == "general.architecture":
-                arch = bytes(f.parts[-1]).decode("utf-8")
-                break
-        if arch and f"{arch}.block_count" in reader.fields:
-            block_count = reader.fields[f"{arch}.block_count"].parts[-1].tolist()[0]
-    except Exception:
-        pass
+    meta = get_gguf_metadata(model_path)
+    arch = meta.get("general.architecture")
+    block_count = 32
+    if arch and f"{arch}.block_count" in meta:
+        block_count = int(meta[f"{arch}.block_count"])
 
     ratio = max(0.0, usable_vram_gb / max(1.0, model_gb))
     safe_layers = max(1, int(block_count * ratio))
@@ -381,12 +373,69 @@ def calculate_auto_gpu_layers(model_path, requested_layers=-1, n_ctx=2048):
     return safe_layers
 
 
+def get_gguf_metadata(model_path, max_kv=120):
+    """
+    Fast binary reader to extract key-value pairs from GGUF metadata
+    without parsing the tensor dictionary or memory-mapping multi-gigabyte files.
+    """
+    import struct
+    meta = {}
+    try:
+        with open(model_path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return meta
+            version = struct.unpack("<I", f.read(4))[0]
+            tensor_count = struct.unpack("<Q", f.read(8))[0]
+            kv_count = struct.unpack("<Q", f.read(8))[0]
+            for _ in range(min(kv_count, max_kv)):
+                kl = struct.unpack("<Q", f.read(8))[0]
+                k = f.read(kl).decode("utf-8", errors="ignore")
+                vt = struct.unpack("<I", f.read(4))[0]
+                if vt == 8:  # string
+                    sl = struct.unpack("<Q", f.read(8))[0]
+                    meta[k] = f.read(sl).decode("utf-8", errors="ignore")
+                elif vt == 4:  # uint32
+                    meta[k] = struct.unpack("<I", f.read(4))[0]
+                elif vt == 5:  # int32
+                    meta[k] = struct.unpack("<i", f.read(4))[0]
+                elif vt == 10:  # uint64
+                    meta[k] = struct.unpack("<Q", f.read(8))[0]
+                elif vt == 11:  # int64
+                    meta[k] = struct.unpack("<q", f.read(8))[0]
+                elif vt == 6:  # float32
+                    meta[k] = struct.unpack("<f", f.read(4))[0]
+                elif vt == 7:  # bool
+                    meta[k] = struct.unpack("<?", f.read(1))[0]
+                else:
+                    break
+    except Exception:
+        pass
+    return meta
+
+
+def get_gguf_architecture(model_path):
+    """
+    Returns the `general.architecture` string from GGUF metadata.
+    """
+    meta = get_gguf_metadata(model_path, max_kv=40)
+    return meta.get("general.architecture")
+
+
 def load_llama_model(model_path, n_ctx=2048, n_gpu_layers=-1, seed=None):
     """
     Loads a GGUF model with llama.cpp, applying automatic safe layer offloading
     if the model exceeds physical GPU memory.
     """
     from llama_cpp import Llama
+
+    arch = get_gguf_architecture(model_path)
+    if arch == "muse-glimmer":
+        raise ValueError(
+            f"Failed to load model '{model_path}': Architecture '{arch}' is a custom/experimental "
+            f"Meta architecture not implemented in upstream llama.cpp. Please load the HuggingFace "
+            f"Transformers version of this model instead."
+        )
+
     layers = calculate_auto_gpu_layers(model_path, requested_layers=n_gpu_layers, n_ctx=n_ctx)
     try:
         return Llama(
@@ -400,14 +449,23 @@ def load_llama_model(model_path, n_ctx=2048, n_gpu_layers=-1, seed=None):
     except ValueError as e:
         if layers > 0:
             print(f"[VRAM Guard] Offload with {layers} layers failed; falling back to CPU (n_gpu_layers=0)...")
-            return Llama(
-                model_path=model_path,
-                n_ctx=n_ctx,
-                n_gpu_layers=0,
-                seed=seed if seed is not None else 42,
-                logits_all=True,
-                verbose=False,
-            )
+            try:
+                return Llama(
+                    model_path=model_path,
+                    n_ctx=n_ctx,
+                    n_gpu_layers=0,
+                    seed=seed if seed is not None else 42,
+                    logits_all=True,
+                    verbose=False,
+                )
+            except ValueError:
+                pass
+
+        if arch:
+            raise RuntimeError(
+                f"Failed to load GGUF model '{model_path}' (architecture: '{arch}'). "
+                f"Ensure the model file is complete and supported by llama.cpp."
+            ) from e
         raise e
 
 
@@ -415,7 +473,7 @@ def list_local_models():
     """
     Scans standard local caches across platforms (Linux, macOS, Windows)
     and optional user directories (MODELS_DIR) for usable GGUF or Transformers models,
-    excluding multimodal projectors (mmproj) and non-primary split GGUF shards.
+    excluding multimodal projectors (mmproj), non-language architectures, and non-primary split GGUF shards.
     """
     import re
     models = []
@@ -431,6 +489,14 @@ def list_local_models():
         # Skip multimodal projectors
         if f.startswith("mmproj") or "mmproj" in f:
             return
+
+        # Skip known non-LLM or unsupported GGUF architectures
+        arch = get_gguf_architecture(full_path)
+        if arch in ["lumina2", "qwen_image", "flux", "diffusion", "wan"]:
+            return  # Skip image/diffusion models
+        if arch == "muse-glimmer":
+            return  # Skip models with architectures unsupported by llama.cpp
+
         # If multi-part split GGUF (e.g. -00002-of-00005.gguf), only keep the first shard (-00001-of-)
         match = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", f)
         if match:
