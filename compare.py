@@ -20,7 +20,7 @@ from sampler import (
 def standard_temperature_sampling_llama(
     llm,
     prompt,
-    max_new_tokens=80,
+    max_new_tokens=128,
     temperature=0.8,
     top_p=0.95,
     seed=42,
@@ -91,7 +91,7 @@ def standard_temperature_sampling_transformers(
     model,
     tokenizer,
     prompt,
-    max_new_tokens=80,
+    max_new_tokens=128,
     temperature=0.8,
     top_p=0.95,
     seed=42,
@@ -136,7 +136,7 @@ def standard_temperature_sampling_transformers(
 def run_comparison_llama(
     llm,
     prompt,
-    max_new_tokens=80,
+    max_new_tokens=128,
     temperature=0.8,
     top_p=0.95,
     cand_k=12,
@@ -233,7 +233,7 @@ def run_comparison_transformers(
     model,
     tokenizer,
     prompt,
-    max_new_tokens=80,
+    max_new_tokens=128,
     temperature=0.8,
     top_p=0.95,
     cand_k=12,
@@ -371,7 +371,7 @@ def main():
         help="Input prompt for generation",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42)")
-    parser.add_argument("--max_new_tokens", type=int, default=80, help="Number of tokens to generate per method")
+    parser.add_argument("--max_new_tokens", type=int, default=128, help="Number of tokens to generate per method (default: 128)")
     parser.add_argument("--temperature", type=float, default=0.8, help="Temperature for standard sampling baseline (default: 0.8)")
     parser.add_argument("--top_p", type=float, default=0.95, help="Top-p for standard sampling baseline (default: 0.95)")
     parser.add_argument("--cand_k", type=int, default=12, help="Candidate pool k for future-entropy (default: 12)")

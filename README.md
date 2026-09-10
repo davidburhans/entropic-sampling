@@ -94,7 +94,7 @@ Compare the 4 sampling methods side-by-side on the exact same model, prompt, and
 uv run entropic-compare \
   --prompt "The old clockmaker discovered that time" \
   --seed 42 \
-  --max_new_tokens 80 \
+  --max_new_tokens 128 \
   --save_markdown comparison_report.md
 
 # Or pass --compare to entropic-sampling:
