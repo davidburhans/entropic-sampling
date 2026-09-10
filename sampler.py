@@ -419,8 +419,16 @@ def main():
     parser.add_argument("--sample", action="store_true", help="Use stochastic multinomial sampling instead of argmax")
     parser.add_argument("--n_gpu_layers", type=int, default=-1, help="Number of layers to offload to GPU (-1 for all)")
     parser.add_argument("--verbose_steps", action="store_true", help="Print alpha and selected tokens at each step")
-    args = parser.parse_args()
+    parser.add_argument("--compare", action="store_true", help="Run comparative benchmark (Greedy vs Temperature vs Alpha-Wave)")
+    args, unknown = parser.parse_known_args()
     
+    if args.compare:
+        import compare
+        # Remove --compare from sys.argv and invoke compare.main()
+        sys.argv = [sys.argv[0]] + [a for a in sys.argv[1:] if a != "--compare"]
+        compare.main()
+        return
+
     model_path = args.model_path
     
     if not model_path:

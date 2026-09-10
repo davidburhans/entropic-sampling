@@ -17,9 +17,10 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 entropic-sampling = "sampler:main"
+entropic-compare = "compare:main"
 
 [tool.hatch.build.targets.wheel]
-include = ["sampler.py"]
+include = ["sampler.py", "compare.py"]
 
 [tool.uv]
 config-settings = { "cmake.args" = "-DGGML_CUDA=on" }

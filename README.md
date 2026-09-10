@@ -82,6 +82,25 @@ uv run entropic-sampling \
   --max_new_tokens 100
 ```
 
+### Comparative Benchmark
+Compare the 4 sampling methods side-by-side on the exact same model, prompt, and random seed to see the difference:
+1. **Greedy Decoding** ($p(w \mid c)$ argmax / Temp 0.0)
+2. **Standard Temperature Sampling** ($T=0.8$, $\text{top-}p=0.95$)
+3. **Static Future-Entropy** ($\alpha = 0.0$ balanced)
+4. **Alpha-Wave Rhythmic Decoding** (oscillating $\alpha \in [-1, 1]$)
+
+```bash
+# Using the dedicated comparison CLI:
+uv run entropic-compare \
+  --prompt "The old clockmaker discovered that time" \
+  --seed 42 \
+  --max_new_tokens 80 \
+  --save_markdown comparison_report.md
+
+# Or pass --compare to entropic-sampling:
+uv run entropic-sampling --compare --prompt "The old clockmaker discovered that time"
+```
+
 ---
 
 ## CLI Options
@@ -100,6 +119,7 @@ uv run entropic-sampling \
 | `--sample` | `flag` | `False` | Use stochastic multinomial sampling instead of argmax |
 | `--n_gpu_layers` | `int` | `-1` | GPU layers offloaded to llama.cpp (-1 for all) |
 | `--verbose_steps` | `flag` | `False` | Print step-by-step alpha, $a$, $b$, and chosen tokens |
+| `--compare` | `flag` | `False` | Run comparative benchmark against greedy & temperature |
 
 ---
 
