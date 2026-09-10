@@ -46,7 +46,7 @@ def standard_temperature_sampling_llama(
     llm.eval(input_ids)
 
     stop_tokens = {llm.token_eos()}
-    for s in ["<turn|>", "<|im_end|>", "<|eot_id|>", "<end_of_turn>", "</s>", "<eos>"]:
+    for s in ["<turn|>", "<|im_end|>", "<|eot_id|>", "<end_of_turn>", "</s>", "<eos>", "<|endoftext|>", "<|eom_id|>"]:
         try:
             toks = llm.tokenize(s.encode("utf-8"), special=True, add_bos=False)
             if len(toks) == 1:
@@ -267,12 +267,22 @@ def run_comparison_transformers(
     wavelength=12.0,
     amp=1.0,
     seed=42,
+    instruct=False,
     stream=True,
 ):
     """
     Runs all 4 sampling methods with HuggingFace Transformers,
     streaming token-by-token output to the terminal in real-time.
     """
+    if instruct and hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        formatted_prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    else:
+        formatted_prompt = prompt
+
     results = {}
 
     runs = [
@@ -281,7 +291,7 @@ def run_comparison_transformers(
             "[1/4] Greedy Decoding (p(w|c) argmax)",
             "Standard greedy decoding (argmax next-token probability).",
             lambda: standard_temperature_sampling_transformers(
-                model, tokenizer, prompt, max_new_tokens=max_new_tokens, temperature=0.0, seed=seed,
+                model, tokenizer, formatted_prompt, max_new_tokens=max_new_tokens, temperature=0.0, seed=seed,
                 stream=stream, return_metrics=True
             ),
         ),
@@ -290,7 +300,7 @@ def run_comparison_transformers(
             f"[2/4] Standard Temperature Sampling (T={temperature}, top-p={top_p})",
             f"Traditional stochastic sampling with temperature={temperature}.",
             lambda: standard_temperature_sampling_transformers(
-                model, tokenizer, prompt, max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p, seed=seed,
+                model, tokenizer, formatted_prompt, max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p, seed=seed,
                 stream=stream, return_metrics=True
             ),
         ),
@@ -299,7 +309,7 @@ def run_comparison_transformers(
             "[3/4] Static Future-Entropy (alpha = 0.0 balanced)",
             "Crossfader balance s(w) = p(w|c) * H_hat(w).",
             lambda: future_entropy_sampler(
-                model, tokenizer, prompt, max_new_tokens=max_new_tokens, cand_k=cand_k, top_n_future=top_n_future,
+                model, tokenizer, formatted_prompt, max_new_tokens=max_new_tokens, cand_k=cand_k, top_n_future=top_n_future,
                 alpha_constant=0.0, sample=False, stream=stream, return_metrics=True
             ),
         ),
@@ -308,7 +318,7 @@ def run_comparison_transformers(
             f"[4/4] Alpha-Wave Rhythmic Decoding (wavelength={wavelength}, amp={amp})",
             f"Sinusoidal alpha wave (wavelength={wavelength}, amp={amp}).",
             lambda: future_entropy_sampler(
-                model, tokenizer, prompt, max_new_tokens=max_new_tokens, cand_k=cand_k, top_n_future=top_n_future,
+                model, tokenizer, formatted_prompt, max_new_tokens=max_new_tokens, cand_k=cand_k, top_n_future=top_n_future,
                 wavelength=wavelength, amp=amp, sample=False, stream=stream, return_metrics=True
             ),
         ),
@@ -451,18 +461,18 @@ def main():
         help="Input prompt for generation",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42)")
-    parser.add_argument("--max_new_tokens", type=int, default=128, help="Number of tokens to generate per method (default: 128)")
+    parser.add_argument("--max_new_tokens", "--max-new-tokens", dest="max_new_tokens", type=int, default=128, help="Number of tokens to generate per method (default: 128)")
     parser.add_argument("--temperature", type=float, default=0.8, help="Temperature for standard sampling baseline (default: 0.8)")
-    parser.add_argument("--top_p", type=float, default=0.95, help="Top-p for standard sampling baseline (default: 0.95)")
-    parser.add_argument("--cand_k", type=int, default=12, help="Candidate pool k for future-entropy (default: 12)")
-    parser.add_argument("--top_n", type=int, default=10, help="Future tokens n for entropy calculation (default: 10)")
+    parser.add_argument("--top_p", "--top-p", dest="top_p", type=float, default=0.95, help="Top-p for standard sampling baseline (default: 0.95)")
+    parser.add_argument("--cand_k", "--cand-k", dest="cand_k", type=int, default=12, help="Candidate pool k for future-entropy (default: 12)")
+    parser.add_argument("--top_n", "--top-n", dest="top_n", type=int, default=10, help="Future tokens n for entropy calculation (default: 10)")
     parser.add_argument("--wavelength", type=float, default=12.0, help="Wavelength of alpha wave (default: 12.0)")
     parser.add_argument("--amp", type=float, default=1.0, help="Amplitude of alpha wave (default: 1.0)")
     parser.add_argument("--instruct", action="store_true", help="Apply model chat template")
     parser.add_argument("--raw", "--no-instruct", dest="raw", action="store_true", help="Force raw prompt completion without chat template")
-    parser.add_argument("--no_stream", action="store_true", help="Disable real-time token streaming during comparison runs")
-    parser.add_argument("--n_gpu_layers", type=int, default=-1, help="Layers to offload to GPU (-1 for all)")
-    parser.add_argument("--save_markdown", type=str, default=None, help="Path to write Markdown comparison report")
+    parser.add_argument("--no_stream", "--no-stream", dest="no_stream", action="store_true", help="Disable real-time token streaming during comparison runs")
+    parser.add_argument("--n_gpu_layers", "--n-gpu-layers", dest="n_gpu_layers", type=int, default=-1, help="Layers to offload to GPU (-1 for all)")
+    parser.add_argument("--save_markdown", "--save-markdown", dest="save_markdown", type=str, default=None, help="Path to write Markdown comparison report")
     args = parser.parse_args()
 
     model_path = args.model_path
@@ -569,6 +579,7 @@ def main():
             wavelength=args.wavelength,
             amp=args.amp,
             seed=args.seed,
+            instruct=instruct,
             stream=stream,
         )
 

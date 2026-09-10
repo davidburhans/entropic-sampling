@@ -227,7 +227,7 @@ def future_entropy_sampler_llama(
 
     # Collect stop tokens
     stop_tokens = {llm.token_eos()}
-    for s in ['<turn|>', '<|im_end|>', '<|eot_id|>', '<end_of_turn>', '</s>', '<eos>']:
+    for s in ['<turn|>', '<|im_end|>', '<|eot_id|>', '<end_of_turn>', '</s>', '<eos>', '<|endoftext|>', '<|eom_id|>']:
         try:
             toks = llm.tokenize(s.encode('utf-8'), special=True, add_bos=False)
             if len(toks) == 1:
@@ -463,6 +463,37 @@ def get_gguf_architecture(model_path):
     return meta.get("general.architecture")
 
 
+def is_causal_lm_dir(model_dir):
+    """
+    Validates whether a directory contains an autoregressive causal language model,
+    filtering out audio, speech, embeddings, diffusion, and speculative assistant models.
+    """
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.isfile(config_path):
+        return False
+    try:
+        import json
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        archs = data.get("architectures", [])
+        if not archs:
+            return False
+        for a in archs:
+            a_lower = a.lower()
+            if any(bad in a_lower for bad in ["diffusion", "bert", "dspark", "assistant", "whisper", "wavlm"]):
+                return False
+            if a.endswith("ForCausalLM") or a.endswith("ForConditionalGeneration") or "causallm" in a_lower:
+                quant_cfg = data.get("quantization_config", {})
+                q_method = str(quant_cfg.get("quant_method", "")).lower()
+                q_algo = str(quant_cfg.get("quant_algo", "")).lower()
+                if "nvfp4" in model_dir.lower() or q_method in ["modelopt", "compressed-tensors"] or q_algo == "nvfp4":
+                    return False
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def load_llama_model(model_path, n_ctx=2048, n_gpu_layers=-1, seed=None):
     """
     Loads a GGUF model with llama.cpp, applying automatic safe layer offloading
@@ -472,16 +503,18 @@ def load_llama_model(model_path, n_ctx=2048, n_gpu_layers=-1, seed=None):
     arch = get_gguf_architecture(model_path)
 
     layers = calculate_auto_gpu_layers(model_path, requested_layers=n_gpu_layers, n_ctx=n_ctx)
+    use_flash_attn = torch.cuda.is_available() and layers != 0
     try:
         return Llama(
             model_path=model_path,
             n_ctx=n_ctx,
             n_gpu_layers=layers,
+            flash_attn=use_flash_attn,
             seed=seed if seed is not None else 42,
             logits_all=True,
             verbose=False,
         )
-    except ValueError as e:
+    except Exception as e:
         if layers > 0:
             print(f"[VRAM Guard] Offload with {layers} layers failed; falling back to CPU (n_gpu_layers=0)...")
             try:
@@ -489,11 +522,12 @@ def load_llama_model(model_path, n_ctx=2048, n_gpu_layers=-1, seed=None):
                     model_path=model_path,
                     n_ctx=n_ctx,
                     n_gpu_layers=0,
+                    flash_attn=False,
                     seed=seed if seed is not None else 42,
                     logits_all=True,
                     verbose=False,
                 )
-            except ValueError:
+            except Exception:
                 pass
 
         if arch:
@@ -502,6 +536,17 @@ def load_llama_model(model_path, n_ctx=2048, n_gpu_layers=-1, seed=None):
                     f"Failed to load GGUF model '{model_path}' (architecture: 'muse-glimmer'). "
                     f"The 'muse-glimmer' architecture was added in llama.cpp build b10353. "
                     f"Your llama-cpp-python package must be version 0.3.35+ compiled against llama.cpp b10353+ to load this model."
+                ) from e
+            elif arch in ["qwen4exp", "glm5next"]:
+                raise RuntimeError(
+                    f"Failed to load GGUF model '{model_path}' (architecture: '{arch}'). "
+                    f"The '{arch}' architecture was added in bleeding-edge llama.cpp (builds b10660+). "
+                    f"It is not yet supported in current PyPI llama-cpp-python releases."
+                ) from e
+            elif arch in ["dflash"] or arch.endswith("-assistant"):
+                raise RuntimeError(
+                    f"Failed to load GGUF model '{model_path}' (architecture: '{arch}'). "
+                    f"This file is a speculative decoding draft head / assistant model and cannot be run as a standalone language model."
                 ) from e
             raise RuntimeError(
                 f"Failed to load GGUF model '{model_path}' (architecture: '{arch}'). "
@@ -514,7 +559,8 @@ def list_local_models():
     """
     Scans standard local caches across platforms (Linux, macOS, Windows)
     and optional user directories (MODELS_DIR) for usable GGUF or Transformers models,
-    excluding multimodal projectors (mmproj), non-language architectures, and non-primary split GGUF shards.
+    excluding multimodal projectors (mmproj), non-language architectures, speculative drafters,
+    and non-primary split GGUF shards.
     """
     import re
     models = []
@@ -531,10 +577,16 @@ def list_local_models():
         if f.startswith("mmproj") or "mmproj" in f:
             return
 
-        # Skip known non-LLM architectures (e.g. image diffusion models)
+        # Skip speculative draft models and assistant heads
+        if f.startswith("dflash") or "dflash" in f or f.startswith("mtp-") or "/MTP/" in full_path or "\\MTP\\" in full_path:
+            return
+
+        # Skip known non-LLM or unsupported GGUF architectures
         arch = get_gguf_architecture(full_path)
-        if arch in ["lumina2", "qwen_image", "flux", "diffusion", "wan"]:
-            return  # Skip image/diffusion models
+        if arch in ["lumina2", "qwen_image", "flux", "diffusion", "wan", "dflash", "qwen4exp", "glm5next"]:
+            return  # Skip image/diffusion/experimental unsupported architectures
+        if arch and arch.endswith("-assistant"):
+            return  # Skip speculative assistant draft models
 
         # If multi-part split GGUF (e.g. -00002-of-00005.gguf), only keep the first shard (-00001-of-)
         match = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", f)
@@ -567,7 +619,7 @@ def list_local_models():
                     if f.endswith(".gguf"):
                         rel = os.path.relpath(os.path.join(root, f), cdir)
                         process_gguf_file(f, os.path.join(root, f), f"[Local Dir] {rel}")
-                if os.path.exists(os.path.join(root, "config.json")):
+                if os.path.exists(os.path.join(root, "config.json")) and is_causal_lm_dir(root):
                     rel = os.path.relpath(root, cdir)
                     dir_size = get_model_size_bytes(root)
                     add_model(f"[Local Transformers] {rel} ({format_size(dir_size)})", root, "transformers")
@@ -594,7 +646,7 @@ def list_local_models():
                                     rel = os.path.relpath(os.path.join(root, f), snap_path)
                                     process_gguf_file(f, os.path.join(root, f), f"[HF GGUF] {model_name} ({rel})")
                                     found_gguf = True
-                        if not found_gguf and os.path.exists(os.path.join(snap_path, "config.json")):
+                        if not found_gguf and os.path.exists(os.path.join(snap_path, "config.json")) and is_causal_lm_dir(snap_path):
                             dir_size = get_model_size_bytes(snap_path)
                             add_model(f"[HF Transformers] {model_name} ({format_size(dir_size)})", snap_path, "transformers")
 
@@ -649,17 +701,17 @@ def main():
     parser.add_argument("--prompt", type=str, default="Once upon a time in a futuristic city,", help="Input prompt")
     parser.add_argument("--instruct", action="store_true", help="Format prompt with model chat template")
     parser.add_argument("--raw", "--no-instruct", dest="raw", action="store_true", help="Force raw prompt completion without chat template")
-    parser.add_argument("--max_new_tokens", type=int, default=80, help="Number of tokens to generate")
-    parser.add_argument("--cand_k", type=int, default=8, help="Candidates k to evaluate at each step (default: 8)")
-    parser.add_argument("--top_n", type=int, default=10, help="Top n future tokens for entropy (default: 10)")
+    parser.add_argument("--max_new_tokens", "--max-new-tokens", dest="max_new_tokens", type=int, default=80, help="Number of tokens to generate")
+    parser.add_argument("--cand_k", "--cand-k", dest="cand_k", type=int, default=8, help="Candidates k to evaluate at each step (default: 8)")
+    parser.add_argument("--top_n", "--top-n", dest="top_n", type=int, default=10, help="Top n future tokens for entropy (default: 10)")
     parser.add_argument("--wavelength", type=float, default=12.0, help="Wavelength of alpha sine wave in tokens (default: 12.0)")
     parser.add_argument("--amp", type=float, default=0.65, help="Amplitude for alpha wave (default: 0.65)")
-    parser.add_argument("--min_p", type=float, default=0.01, help="Minimum candidate probability to evaluate (default: 0.01)")
+    parser.add_argument("--min_p", "--min-p", dest="min_p", type=float, default=0.01, help="Minimum candidate probability to evaluate (default: 0.01)")
     parser.add_argument("--alpha", type=float, default=None, help="Fixed alpha in [-1.0, 1.0] to test static crossfader without wave")
     parser.add_argument("--sample", action="store_true", help="Use stochastic multinomial sampling instead of argmax")
-    parser.add_argument("--n_gpu_layers", type=int, default=-1, help="Number of layers to offload to GPU (-1 for all)")
-    parser.add_argument("--verbose_steps", action="store_true", help="Print alpha and selected tokens at each step")
-    parser.add_argument("--no_stream", action="store_true", help="Disable real-time token streaming")
+    parser.add_argument("--n_gpu_layers", "--n-gpu-layers", dest="n_gpu_layers", type=int, default=-1, help="Number of layers to offload to GPU (-1 for all)")
+    parser.add_argument("--verbose_steps", "--verbose-steps", dest="verbose_steps", action="store_true", help="Print alpha and selected tokens at each step")
+    parser.add_argument("--no_stream", "--no-stream", dest="no_stream", action="store_true", help="Disable real-time token streaming")
     parser.add_argument("--compare", action="store_true", help="Run comparative benchmark (Greedy vs Temperature vs Alpha-Wave)")
     args, unknown = parser.parse_known_args()
     
